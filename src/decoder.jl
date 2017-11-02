@@ -41,12 +41,10 @@ OggDecoder(fname::AbstractString) = OggDecoder(open(fname), true)
 function OggDecoder(f::Function, io)
     dec = OggDecoder(io)
     try
-        retval = f(dec)
+        f(dec)
     finally
         close(dec)
     end
-
-    retval
 end
 
 function Base.close(dec::OggDecoder)
@@ -54,6 +52,73 @@ function Base.close(dec::OggDecoder)
         close(dec.io)
     end
     nothing
+end
+
+"""
+    eachpage(dec::OggDecoder)
+
+Returns an iterator you can use to get the pages from an ogg stream. Note that
+the page will point to data within the decoder buffer, and is only valid until
+the next page is provided. Often the page will be inserted into a `PageSink`
+within the iterator loop, which will handle copying the data to its own buffer
+
+## Examples
+
+```julia
+dec = OggDecoder("someotherfile.ogg")
+streams = Dict{Int, PageSink}()
+
+# we'll use the page in the loop so we don't need to copy the data
+for page in eachpage(dec)
+    if bos(page)
+        # PacketDecoder is a stand-in for something that expects packets
+        streams[serial(page)] = PageSink(PacketDecoder())
+    end
+    sink = streams[serial(page)]
+    write(sink, page)
+end
+```
+"""
+eachpage(dec::OggDecoder) = OggPageIterator(dec)
+
+struct OggPageIterator
+    dec::OggDecoder
+end
+
+# we want to keep one page ahead of the iterator, so that we know ahead of time
+# if we're done
+Base.start(iter::OggPageIterator) = readpage(iter.dec)
+Base.next(iter::OggPageIterator, next) = return get(next), readpage(iter.dec)
+Base.done(iter::OggPageIterator, next) = isnull(next)
+
+# we'll try to read from the underlying stream in chunks this size
+const READ_CHUNK_SIZE = 4096
+
+"""
+    readpage(dec::OggDecoder)::Nullable{OggPage}
+
+Read the next page from the ogg decoder. Returns the nullable-wrapped page,
+which is null if there are no more pages. This function will block the task if
+it needs to wait to read from the underlying IO stream.
+"""
+function readpage(dec::OggDecoder)
+    # first check to see if there's already a page ready
+    page = ogg_sync_pageout(dec)
+    if !isnull(page)
+        return page
+    end
+    # no pages ready, so read more data until we get one
+    while !eof(dec.io)
+        buffer = ogg_sync_buffer(dec, READ_CHUNK_SIZE)
+        bytes_read = readbytes!(dec.io, buffer, READ_CHUNK_SIZE)
+        ogg_sync_wrote(dec, bytes_read)
+        page = ogg_sync_pageout(dec)
+        if !isnull(page)
+            return page
+        end
+    end
+    # we hit EOF without reading a page
+    return Nullable{OggPage}()
 end
 
 # function show(io::IO, x::OggDecoder)
@@ -117,35 +182,30 @@ function ogg_sync_wrote(dec::OggDecoder, size)
 end
 
 """
-    ogg_sync_pageout(dec::OggDecoder)
+    ogg_sync_pageout(dec::OggDecoder)::Nullable{OggPage}
 
 Takes the data stored in the buffer of the decoder and inserts them into an
-ogg_page.
-
-In an actual decoding loop, this function should be called first to ensure that
-the buffer is cleared. The example code below illustrates a clean reading loop
-which will fill and output pages.
+ogg_page. Note that the payload data in the page is not copied, so the memory
+the OggPage points to is still contained within the ogg_sync_state struct.
 
 Caution:This function should be called before reading into the buffer to ensure
 that data does not remain in the ogg_sync_state struct. Failing to do so may
 result in a memory leak. See the example code below for details.
 
-Returns a new OggPage if it was available, or `nothing` if not.
+Returns a new OggPage if it was available, or null if not, wrapped in a
+`Nullable{OggPage}`.
 
 (docs adapted from https://xiph.org/ogg/doc/libogg/ogg_sync_pageout.html)
 """
 function ogg_sync_pageout(dec::OggDecoder)
-    # TODO: not type-stable - think about tweaking the API or using Nullable
-    # TODO: I think we can use Ref(x) instead of Ref{T}(x) for these
-    syncref = Ref{OggSyncState}(dec.sync_state)
-    pageref = Ref{OggPage}(OggPage())
-    # TODO: does this ever partially-fill the given page?
+    syncref = Ref(dec.sync_state)
+    pageref = Ref(OggPage())
     status = ccall((:ogg_sync_pageout,libogg), Cint, (Ref{OggSyncState}, Ref{OggPage}), syncref, pageref)
     dec.sync_state = syncref[]
     if status == 1
-        return pageref[]
+        return Nullable{OggPage}(pageref[])
     else
-        return nothing
+        return Nullable{OggPage}()
     end
 end
 
@@ -154,7 +214,7 @@ end
 
 Returns the serial number of the given page
 """
-function ogg_page_serialno(page::OggPage)
+function serial(page::OggPage)
     pageref = Ref{OggPage}(page)
     return Clong(ccall((:ogg_page_serialno,libogg), Cint, (Ref{OggPage},), pageref))
 end
@@ -164,14 +224,27 @@ end
 
 Indicates whether the given page is an end-of-stream
 """
-function ogg_page_eos(page::OggPage)
+function eos(page::OggPage)
     pageref = Ref{OggPage}(page)
-    return ccall((:ogg_page_eos,libogg), Cint, (Ref{OggPage},), pageref)
+    return ccall((:ogg_page_eos,libogg), Cint, (Ref{OggPage},), pageref) != 0
+end
+
+"""
+    ogg_page_bos(page::OggPage)
+
+Indicates whether the given page is an end-of-stream
+"""
+function bos(page::OggPage)
+    pageref = Ref{OggPage}(page)
+    return ccall((:ogg_page_eos,libogg), Cint, (Ref{OggPage},), pageref) != 0
 end
 
 
 """
-Send a page in, return the serial number of the stream that we just decoded
+Send a page in, return the serial number of the stream that we just decoded.
+
+This actually copies the data that the OggPage points to (contained within the
+ogg_sync_state struct) into the `ogg_stream_state` struct.
 """
 function ogg_stream_pagein(dec::OggDecoder, page::OggPage)
     serial = ogg_page_serialno(page)
@@ -184,6 +257,7 @@ function ogg_stream_pagein(dec::OggDecoder, page::OggPage)
         dec.streams[serial] = streamref[]
 
         # Also initialize dec.packets and dec.pages for this serial
+        # TODO: the data these pages point to is probably not valid
         dec.pages[serial] = Vector{Vector{UInt8}}()
         dec.packets[serial] = Vector{Vector{UInt8}}()
     end
@@ -201,6 +275,8 @@ function ogg_stream_pagein(dec::OggDecoder, page::OggPage)
     return serial
 end
 
+# note that this doesn't actually copy the data into the packet, it just makes
+# the packet point to the data within the stream
 function ogg_stream_packetout(dec::OggDecoder, serial::Clong; retry::Bool = false)
     if !haskey(dec.streams, serial)
         return nothing

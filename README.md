@@ -30,17 +30,18 @@ The images [here](https://xiph.org/ogg/doc/oggstream.html) are useful for visual
 We want to support streaming read/write, with the following API:
 
 ```julia
-dec = OggDecoder("filename.ogg") # should also support using an `IO`
+julia> dec = OggDecoder("filename.ogg") # should also support using an `IO`
 
 # generally users don't care about pages, but we'll use this internally
-for page in pages(dec)
+julia> for page in pages(dec)
     ...
 end
 
-#or
-
-dec = OggDecoder("filename.ogg")
-streams(dec)
+julia> streams(dec)
+3-element Array{OggPacketStream,1}:
+ 0.578832
+ 0.411074
+ 0.587217
 
 ```
 

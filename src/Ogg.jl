@@ -2,9 +2,9 @@ __precompile__()
 module Ogg
 using FileIO
 import Base: show, convert
-export OggDecoder, OggEncoder
-export pages, packets
-export PageSink
+export OggDecoder, OggEncoder, OggPage, PageSink
+export serial, eos, bos
+export eachpage
 
 const depfile = joinpath(dirname(@__FILE__), "..", "deps", "deps.jl")
 if isfile(depfile)
