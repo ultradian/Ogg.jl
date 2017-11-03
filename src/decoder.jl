@@ -121,6 +121,32 @@ function readpage(dec::OggDecoder)
     return Nullable{OggPage}()
 end
 
+"""
+    PageSink(packetsink)
+
+Decodes pages into packets (each a `Vector{UInt8}`) and writes the packets to
+the wrapped sink. Generally when decoding an Ogg file you'll have an instance
+of this type for each logical stream multiplexed into the file.
+"""
+struct PageSink{T}
+    packetsink::T
+    streamstate::Ref{OggStreamState}
+end
+
+function PageSink(packetsink)
+    streamref = Ref(OggStreamState())
+    status = ccall((:ogg_stream_init,libogg), Cint,
+                   (Ref{OggStreamState}, Cint), streamref, serial)
+    if status != 0
+        error("ogg_stream_init() failed with status $status")
+    end
+    PageSink(packetsink, streamref)
+end
+
+function Base.write(sink::PageSink, page::OggPage)
+    ogg_stream_pagein(sink.streamstate, page)
+end
+
 # function show(io::IO, x::OggDecoder)
 #     num_streams = length(x.streams)
 #     if num_streams != 1
@@ -243,48 +269,25 @@ end
 """
 Send a page in, return the serial number of the stream that we just decoded.
 
-This actually copies the data that the OggPage points to (contained within the
-ogg_sync_state struct) into the `ogg_stream_state` struct.
+This copies the data that the OggPage points to (contained within the
+`ogg_sync_state` struct) into the `ogg_stream_state` struct.
 """
-function ogg_stream_pagein(dec::OggDecoder, page::OggPage)
-    serial = ogg_page_serialno(page)
-    if !haskey(dec.streams, serial)
-        streamref = Ref{OggStreamState}(OggStreamState())
-        status = ccall((:ogg_stream_init,libogg), Cint, (Ref{OggStreamState}, Cint), streamref, serial)
-        if status != 0
-            error("ogg_stream_init() failed: Unknown failure")
-        end
-        dec.streams[serial] = streamref[]
-
-        # Also initialize dec.packets and dec.pages for this serial
-        # TODO: the data these pages point to is probably not valid
-        dec.pages[serial] = Vector{Vector{UInt8}}()
-        dec.packets[serial] = Vector{Vector{UInt8}}()
-    end
-
-    # Save the page in dec.pages for posterity
-    push!(dec.pages[serial], page)
-
-    streamref = Ref{OggStreamState}(dec.streams[serial])
-    pageref = Ref{OggPage}(page)
-    status = ccall((:ogg_stream_pagein,libogg), Cint, (Ref{OggStreamState}, Ref{OggPage}), streamref, pageref)
-    dec.streams[serial] = streamref[]
+function ogg_stream_pagein(streamref::Ref{OggStreamState}, page::OggPage)
+    pageref = Ref(page)
+    status = ccall((:ogg_stream_pagein,libogg), Cint,
+                   (Ref{OggStreamState}, Ref{OggPage}), streamref, pageref)
     if status != 0
-        error("ogg_stream_pagein() failed: Unknown failure")
+        error("ogg_stream_pagein() failed with status $status")
     end
-    return serial
+    nothing
 end
 
 # note that this doesn't actually copy the data into the packet, it just makes
 # the packet point to the data within the stream
-function ogg_stream_packetout(dec::OggDecoder, serial::Clong; retry::Bool = false)
-    if !haskey(dec.streams, serial)
-        return nothing
-    end
-    streamref = Ref{OggStreamState}(dec.streams[serial])
+function ogg_stream_packetout(streamref::Ref{OggStreamState}, retry=false)
     packetref = Ref{OggPacket}(OggPacket())
-    status = ccall((:ogg_stream_packetout,libogg), Cint, (Ref{OggStreamState}, Ref{OggPacket}), streamref, packetref)
-    dec.streams[serial] = streamref[]
+    status = ccall((:ogg_stream_packetout,libogg), Cint,
+                   (Ref{OggStreamState}, Ref{OggPacket}), streamref, packetref)
     if status == 1
         return packetref[]
     else
