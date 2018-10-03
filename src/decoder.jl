@@ -55,30 +55,18 @@ function Base.close(dec::OggDecoder)
 end
 
 """
-    eachpage(dec::OggDecoder)
+    eachpage(dec::OggDecoder; copy=true)
 
-Returns an iterator you can use to get the pages from an ogg stream. Note that
-the page will point to data within the decoder buffer, and is only valid until
-the next page is provided. Often the page will be inserted into a `PageSink`
-within the iterator loop, which will handle copying the data to its own buffer
+Returns an iterator you can use to get the pages from an ogg physical bitstream.
+If you pass the `copy=false` keyword argument then the page will point to data
+within the decoder buffer, and is only valid until the next page is provided.
 
 ## Examples
 
 ```julia
-dec = OggDecoder("someotherfile.ogg")
-streams = Dict{Int, PageSink}()
-
-# we'll use the page in the loop so we don't need to copy the data
-for page in eachpage(dec)
-    if bos(page)
-        # PacketDecoder is a stand-in for something that expects packets
-        streams[serial(page)] = PageSink(PacketDecoder())
-    end
-    sink = streams[serial(page)]
-    write(sink, page)
-end
 ```
 """
+# TODO: add copy kwarg
 eachpage(dec::OggDecoder) = OggPageIterator(dec)
 
 struct OggPageIterator
@@ -121,40 +109,62 @@ function readpage(dec::OggDecoder)
     return Nullable{OggPage}()
 end
 
-"""
-    PageSink(packetsink)
+# currently frankensteined from the old PageSink, not tested, just a place
+# to put that code in case it's useful
+struct OggLogicalStream
+    state::OggStreamState
+    serial::Cint
+    container::OggDecoder
 
-Decodes pages into packets (each a `Vector{UInt8}`) and writes the packets to
-the wrapped sink. Generally when decoding an Ogg file you'll have an instance
-of this type for each logical stream multiplexed into the file.
-"""
-struct PageSink{T}
-    packetsink::T
-    streamstate::Ref{OggStreamState}
-end
-
-function PageSink(packetsink)
-    streamref = Ref(OggStreamState())
-    status = ccall((:ogg_stream_init,libogg), Cint,
-                   (Ref{OggStreamState}, Cint), streamref, serial)
-    if status != 0
-        error("ogg_stream_init() failed with status $status")
+    function OggLogicalStream(container, serial)
+        stream = new(OggStreamState(), serial, container)
+        status = ccall((:ogg_stream_init,libogg), Cint,
+                       (Ref{OggStreamState}, Cint), Ref(stream.state), serial)
+        if status != 0
+            error("ogg_stream_init() failed with status $status")
+        end
     end
-    PageSink(packetsink, streamref)
 end
 
-function Base.write(sink::PageSink, page::OggPage)
-    ogg_stream_pagein(sink.streamstate, page)
+function Base.open(stream::OggLogicalStream)
+    open_logical_stream(stream.container, stream)
 end
 
-# function show(io::IO, x::OggDecoder)
-#     num_streams = length(x.streams)
-#     if num_streams != 1
-#         write(io, "OggDecoder with $num_streams streams")
-#     else
-#         write(io, "OggDecoder with 1 stream")
-#     end
-# end
+# note it's a little weird that we pass the stream as an argument to the given
+# function, given that the context already has a reference. Seems worth it for
+# consistency with other open... functions though. The thing that makes
+# OggLogicalStream weird is that it starts in a closed state.
+function Base.open(fn::Function, stream::OggLogicalStream)
+    open(stream)
+    try
+        fn(stream)
+    finally
+        close(stream)
+    end
+end
+
+function Base.close(stream::OggLogicalStream)
+    close_logical_stream(stream.container, stream)
+end
+
+"""
+    readpage(stream::OggLogicalStream)
+
+Read a page from the given logical stream.
+"""
+readpage(stream::OggLogicalStream) = readpage(stream.container, stream.serial)
+
+"""
+    readpacket(stream::OggLogicalStream)
+
+Read a packet from the given logical stream.
+"""
+function readpacket(stream::OggLogicalStream)
+    # TODO: check here if we actually need to read a new page
+        nextpage = readpage(stream)
+        ogg_stream_pagein(sink.streamstate, nextpage)
+    # TODO: read out the next packet
+end
 
 """
     ogg_sync_buffer(dec::OggDecoder, size)
