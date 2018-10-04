@@ -1,13 +1,17 @@
 """
-    OggDecoder(io::IO, ownstream=false)
+    OggDecoder(io::IO, own=false)
     OggDecoder(fname::AbstractString)
-    OggDecoder(fn::Function, io)
+    OggDecoder(fn::Function, io::IO; own=false)
+    OggDecoder(fn::Function, fname::AbstractString)
 
 Decodes an Ogg file given by a stream or filename. If opened with a stream, the
-`ownstream` argument determines whether the decoder will handle closing the
+`own` argument determines whether the decoder will handle closing the
 underlying stream when it is closed. You can also use `do` syntax (with either
 a stream or a filename) to to run a block of code, and the decoder will handle
-closing itself afterwards.
+closing itself afterwards. Otherwise the user is responsible for calling `close`
+on the decoder when you are finished with it.
+
+Closing the decoder will also close any open logical streams.
 """
 mutable struct OggDecoder{T<:IO}
     io::T
@@ -16,30 +20,17 @@ mutable struct OggDecoder{T<:IO}
     streams::Dict{Clong,OggStreamState}
 end
 
-function OggDecoder(io::IO, ownstream=false)
-    syncref = Ref{OggSyncState}(OggSyncState())
-    status = ccall((:ogg_sync_init, libogg), Cint, (Ref{OggSyncState},), syncref)
-    if status != 0
-        error("ogg_sync_init() failed: This should never happen")
-    end
-    dec = OggDecoder(io, ownstream, syncref[], Dict{Clong,OggStreamState}())
-
-    # This seems to be causing problems.  :(
-    # finalizer(dec, x -> begin
-    #     for serial in keys(x.streams)
-    #         ogg_stream_destroy(x.streams[serial])
-    #     end
-    #     ogg_sync_destroy(x.sync_state)
-    # end )
-
+function OggDecoder(io::IO; own=false)
+    sync = OggSyncState()
+    dec = OggDecoder(io, own, sync, Dict{Clong,OggStreamState}())
     return dec
 end
 
-OggDecoder(fname::AbstractString) = OggDecoder(open(fname), true)
+OggDecoder(fname::AbstractString) = OggDecoder(open(fname); own=true)
 
 # handle do syntax. this works whether io is a stream or file
-function OggDecoder(f::Function, io)
-    dec = OggDecoder(io)
+function OggDecoder(f::Function, io; kwargs...)
+    dec = OggDecoder(io; kwargs...)
     try
         f(dec)
     finally
@@ -48,9 +39,14 @@ function OggDecoder(f::Function, io)
 end
 
 function Base.close(dec::OggDecoder)
+    # for stream in streams(dec)
+    #     isopen(stream) && close(stream)
+    # end
     if dec.ownstream
         close(dec.io)
     end
+    ogg_sync_clear(dec.sync)
+
     nothing
 end
 
@@ -75,9 +71,9 @@ end
 
 # we want to keep one page ahead of the iterator, so that we know ahead of time
 # if we're done
-Base.start(iter::OggPageIterator) = readpage(iter.dec)
-Base.next(iter::OggPageIterator, next) = return get(next), readpage(iter.dec)
-Base.done(iter::OggPageIterator, next) = isnull(next)
+# Base.start(iter::OggPageIterator) = readpage(iter.dec)
+# Base.next(iter::OggPageIterator, next) = return get(next), readpage(iter.dec)
+# Base.done(iter::OggPageIterator, next) = isnull(next)
 
 # we'll try to read from the underlying stream in chunks this size
 const READ_CHUNK_SIZE = 4096
@@ -116,14 +112,7 @@ struct OggLogicalStream
     serial::Cint
     container::OggDecoder
 
-    function OggLogicalStream(container, serial)
-        stream = new(OggStreamState(), serial, container)
-        status = ccall((:ogg_stream_init,libogg), Cint,
-                       (Ref{OggStreamState}, Cint), Ref(stream.state), serial)
-        if status != 0
-            error("ogg_stream_init() failed with status $status")
-        end
-    end
+    OggLogicalStream(container, serial) = stream = new(OggStreamState(), serial, container)
 end
 
 function Base.open(stream::OggLogicalStream)
@@ -164,149 +153,6 @@ function readpacket(stream::OggLogicalStream)
         nextpage = readpage(stream)
         ogg_stream_pagein(sink.streamstate, nextpage)
     # TODO: read out the next packet
-end
-
-"""
-    ogg_sync_buffer(dec::OggDecoder, size)
-
-Provide a buffer for writing new raw data into.
-
-Buffer space which has already been returned is cleared, and the buffer is
-extended as necessary by the size plus some additional bytes. Within the current
-implementation, an extra 4096 bytes are allocated, but applications should not
-rely on this additional buffer space.
-
-The buffer exposed by this function is empty internal storage from the
-`ogg_sync_state` struct, beginning at the fill mark within the struct.
-
-After copying data into this buffer you should call `ogg_sync_wrote` to tell the
-`ogg_sync_state` struct how many bytes were actually written, and update the
-fill mark.
-
-Returns an `Array` wrapping the provided buffer
-
-(docs adapted from https://xiph.org/ogg/doc/libogg/ogg_sync_buffer.html)
-"""
-function ogg_sync_buffer(dec::OggDecoder, size)
-    syncref = Ref{OggSyncState}(dec.sync_state)
-    buffer = ccall((:ogg_sync_buffer,libogg), Ptr{UInt8}, (Ref{OggSyncState}, Clong), syncref, size)
-    dec.sync_state = syncref[]
-    if buffer == C_NULL
-        error("ogg_sync_buffer() failed: returned buffer NULL")
-    end
-    return unsafe_wrap(Array, buffer, size)
-end
-
-"""
-    ogg_sync_wrote(dec::OggDecoder, size)
-
-Tell the ogg_sync_state struct how many bytes we wrote into the buffer.
-
-The general proceedure is to request a pointer into an internal ogg_sync_state
-buffer by calling ogg_sync_buffer(). The buffer is then filled up to the
-requested size with new input, and ogg_sync_wrote() is called to advance the
-fill pointer by however much data was actually available.
-"""
-function ogg_sync_wrote(dec::OggDecoder, size)
-    syncref = Ref{OggSyncState}(dec.sync_state)
-    status = ccall((:ogg_sync_wrote,libogg), Cint, (Ref{OggSyncState}, Clong), syncref, size)
-    dec.sync_state = syncref[]
-    if status != 0
-        error("ogg_sync_wrote() failed: error code $status")
-    end
-    nothing
-end
-
-"""
-    ogg_sync_pageout(dec::OggDecoder)::Nullable{OggPage}
-
-Takes the data stored in the buffer of the decoder and inserts them into an
-ogg_page. Note that the payload data in the page is not copied, so the memory
-the OggPage points to is still contained within the ogg_sync_state struct.
-
-Caution:This function should be called before reading into the buffer to ensure
-that data does not remain in the ogg_sync_state struct. Failing to do so may
-result in a memory leak. See the example code below for details.
-
-Returns a new OggPage if it was available, or null if not, wrapped in a
-`Nullable{OggPage}`.
-
-(docs adapted from https://xiph.org/ogg/doc/libogg/ogg_sync_pageout.html)
-"""
-function ogg_sync_pageout(dec::OggDecoder)
-    syncref = Ref(dec.sync_state)
-    pageref = Ref(OggPage())
-    status = ccall((:ogg_sync_pageout,libogg), Cint, (Ref{OggSyncState}, Ref{OggPage}), syncref, pageref)
-    dec.sync_state = syncref[]
-    if status == 1
-        return Nullable{OggPage}(pageref[])
-    else
-        return Nullable{OggPage}()
-    end
-end
-
-"""
-    ogg_page_serialno(page::OggPage)
-
-Returns the serial number of the given page
-"""
-function serial(page::OggPage)
-    pageref = Ref{OggPage}(page)
-    return Clong(ccall((:ogg_page_serialno,libogg), Cint, (Ref{OggPage},), pageref))
-end
-
-"""
-    ogg_page_eos(page::OggPage)
-
-Indicates whether the given page is an end-of-stream
-"""
-function eos(page::OggPage)
-    pageref = Ref{OggPage}(page)
-    return ccall((:ogg_page_eos,libogg), Cint, (Ref{OggPage},), pageref) != 0
-end
-
-"""
-    ogg_page_bos(page::OggPage)
-
-Indicates whether the given page is an end-of-stream
-"""
-function bos(page::OggPage)
-    pageref = Ref{OggPage}(page)
-    return ccall((:ogg_page_eos,libogg), Cint, (Ref{OggPage},), pageref) != 0
-end
-
-
-"""
-Send a page in, return the serial number of the stream that we just decoded.
-
-This copies the data that the OggPage points to (contained within the
-`ogg_sync_state` struct) into the `ogg_stream_state` struct.
-"""
-function ogg_stream_pagein(streamref::Ref{OggStreamState}, page::OggPage)
-    pageref = Ref(page)
-    status = ccall((:ogg_stream_pagein,libogg), Cint,
-                   (Ref{OggStreamState}, Ref{OggPage}), streamref, pageref)
-    if status != 0
-        error("ogg_stream_pagein() failed with status $status")
-    end
-    nothing
-end
-
-# note that this doesn't actually copy the data into the packet, it just makes
-# the packet point to the data within the stream
-function ogg_stream_packetout(streamref::Ref{OggStreamState}, retry=false)
-    packetref = Ref{OggPacket}(OggPacket())
-    status = ccall((:ogg_stream_packetout,libogg), Cint,
-                   (Ref{OggStreamState}, Ref{OggPacket}), streamref, packetref)
-    if status == 1
-        return packetref[]
-    else
-        # Is our status -1?  That means we're desynchronized and should try again, at least once
-        if status == -1 && !retry
-            return ogg_stream_packetout(dec, serial; retry = true)
-        end
-        return nothing
-    end
 end
 
 function decode_all_pages(dec::OggDecoder, enc_io::IO; chunk_size::Integer = 4096)
@@ -369,8 +215,8 @@ function load(fio::IO; chunk_size=4096)
     return dec.packets
 end
 
-function load(file_path::Union{File{format"OGG"},AbstractString}; chunk_size=4096)
-    open(file_path) do fio
-        return load(fio)
-    end
-end
+# function load(file_path::Union{File{format"OGG"},AbstractString}; chunk_size=4096)
+#     open(file_path) do fio
+#         return load(fio)
+#     end
+# end

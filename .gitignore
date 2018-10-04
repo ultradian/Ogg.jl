@@ -1,5 +1,6 @@
 .DS_Store
 deps/deps.jl
+deps/build.log
 
 *.jl.cov
 *.jl.*.cov
