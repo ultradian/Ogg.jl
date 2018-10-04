@@ -2,7 +2,7 @@ __precompile__()
 module Ogg
 
 export OggDecoder, OggPage
-export serial, bos, eos, readpage
+export eachpage, readpage, serial, bos, eos
 
 # using FileIO
 # import Base: show, convert

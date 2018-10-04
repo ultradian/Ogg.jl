@@ -110,24 +110,23 @@ end
 Returns an iterator you can use to get the pages from an ogg physical bitstream.
 If you pass the `copy=false` keyword argument then the page will point to data
 within the decoder buffer, and is only valid until the next page is provided.
-
-## Examples
-
-```julia
-```
 """
-# TODO: add copy kwarg
-eachpage(dec::OggDecoder) = OggPageIterator(dec)
+eachpage(dec::OggDecoder; copy=true) = OggPageIterator(dec, copy)
 
 struct OggPageIterator
     dec::OggDecoder
+    copy::Bool
 end
 
-# we want to keep one page ahead of the iterator, so that we know ahead of time
-# if we're done
-# Base.start(iter::OggPageIterator) = readpage(iter.dec)
-# Base.next(iter::OggPageIterator, next) = return get(next), readpage(iter.dec)
-# Base.done(iter::OggPageIterator, next) = isnull(next)
+Base.IteratorSize(::Type{OggPageIterator}) = Base.SizeUnknown()
+Base.eltype(::OggPageIterator) = OggPage
+
+function Base.iterate(i::OggPageIterator, state=nothing)
+    nextpage = readpage(i.dec, copy=i.copy)
+    nextpage === nothing && return nothing
+
+    (nextpage, nothing)
+end
 
 # we'll try to read from the underlying stream in chunks this size
 const READ_CHUNK_SIZE = 4096

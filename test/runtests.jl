@@ -77,6 +77,13 @@ using Compat.Test
         @test page === nothing
     end
 
+    OggDecoder(joinpath(@__DIR__, "zero.ogg")) do dec
+        pages = collect(eachpage(dec))
+        @test length(pages) == 1
+        @test serial(pages[1]) == 1238561138
+    end
+
+
     # # There is only one stream, and we know its serial number
     # @test collect(keys(ogg_packets)) == [1238561138]
     # serial = first(keys(ogg_packets))
