@@ -134,13 +134,13 @@ function save(fio::IO, packets::Dict{Clong,Vector{Vector{UInt8}}}, granulepos::D
     end
 end
 
-function save(file_path::Union{File{format"OGG"},AbstractString}, packets::Dict{Clong,Vector{Vector{UInt8}}}, granulepos::Dict{Clong,Vector{Int64}})
-    open(file_path, "w") do fio
-        save(fio, packets, granulepos)
-    end
-end
-
-# Convenience save() function for single-stream Ogg files, assigns an arbitrary stream ID
-function save(file_path::Union{File{format"OGG"},AbstractString,IO}, packets::Vector{Vector{UInt8}}, granulepos::Vector{Int64})
-    return save(file_path, Dict(314159265 => packets), Dict(314159265 => granulepos))
-end
+# function save(file_path::Union{File{format"OGG"},AbstractString}, packets::Dict{Clong,Vector{Vector{UInt8}}}, granulepos::Dict{Clong,Vector{Int64}})
+#     open(file_path, "w") do fio
+#         save(fio, packets, granulepos)
+#     end
+# end
+#
+# # Convenience save() function for single-stream Ogg files, assigns an arbitrary stream ID
+# function save(file_path::Union{File{format"OGG"},AbstractString,IO}, packets::Vector{Vector{UInt8}}, granulepos::Vector{Int64})
+#     return save(file_path, Dict(314159265 => packets), Dict(314159265 => granulepos))
+# end

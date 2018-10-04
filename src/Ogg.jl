@@ -1,7 +1,8 @@
 __precompile__()
 module Ogg
 
-export OggDecoder
+export OggDecoder, OggPage
+export serial, bos, eos, readpage
 
 # using FileIO
 # import Base: show, convert
@@ -18,6 +19,6 @@ end
 
 include("libogg.jl")
 include("decoder.jl")
-# include("encoder.jl")
+include("encoder.jl")
 
 end # module

@@ -11,19 +11,22 @@ a stream or a filename) to to run a block of code, and the decoder will handle
 closing itself afterwards. Otherwise the user is responsible for calling `close`
 on the decoder when you are finished with it.
 
+Note that opening an `OggDecoder` will automatically consume the initial `BOS`
+page(s) in the physical stream, so that it can build a list of logical streams.
+
 Closing the decoder will also close any open logical streams.
 """
 mutable struct OggDecoder{T<:IO}
     io::T
     ownstream::Bool
-    sync_state::OggSyncState
+    syncstate::OggSyncState
     streams::Dict{Clong,OggStreamState}
 end
 
 function OggDecoder(io::IO; own=false)
     sync = OggSyncState()
-    dec = OggDecoder(io, own, sync, Dict{Clong,OggStreamState}())
-    return dec
+
+    OggDecoder(io, own, sync, Dict{Clong, OggStreamState}())
 end
 
 OggDecoder(fname::AbstractString) = OggDecoder(open(fname); own=true)
@@ -45,10 +48,61 @@ function Base.close(dec::OggDecoder)
     if dec.ownstream
         close(dec.io)
     end
-    ogg_sync_clear(dec.sync)
+    ogg_sync_clear(dec.syncstate)
 
     nothing
 end
+
+"""
+The OggPage struct encapsulates the data for an Ogg page.
+
+Ogg pages are the fundamental unit of framing and interleave in an ogg
+bitstream. They are made up of packet segments of 255 bytes each. There can be
+as many as 255 packet segments per page, for a maximum page size of a little
+under 64 kB. This is not a practical limitation as the segments can be joined
+across page boundaries allowing packets of arbitrary size. In practice many
+applications will not completely fill all pages because they flush the
+accumulated packets periodically order to bound latency more tightly.
+
+Normally within libogg the `ogg_page` struct doesn't carry its own memory, it
+points to data within the `ogg_sync_state` struct. Here we create our own
+`OggPage` type that can hold data, and use `RawOggPage` as the type that maps to
+the libogg `ogg_page` struct. Remember to use `GC.@preserve` to make sure this
+object is retained during any `ccall`s that use the underlying `RawOggPage`
+struct.
+"""
+struct OggPage
+    page::RawOggPage
+    headerbuf::Union{Vector{UInt8}, Nothing}
+    bodybuf::Union{Vector{UInt8}, Nothing}
+end
+
+function OggPage(page::RawOggPage; copy=true)
+    if !copy
+        OggPage(page, nothing, nothing)
+    else
+        deepcopy(OggPage(page, copy=false))
+    end
+end
+
+serial(page::OggPage) = ogg_page_serialno(page.page)
+bos(page::OggPage) = ogg_page_bos(page.page)
+eos(page::OggPage) = ogg_page_eos(page.page)
+
+function Base.deepcopy(page::OggPage)
+    headerbuf = Vector{UInt8}(undef, page.page.header_len)
+    unsafe_copyto!(pointer(headerbuf), page.page.header, page.page.header_len)
+    bodybuf = Vector{UInt8}(undef, page.page.body_len)
+    unsafe_copyto!(pointer(bodybuf), page.page.body, page.page.body_len)
+
+    page = RawOggPage(pointer(headerbuf), page.page.header_len,
+                    pointer(bodybuf), page.page.body_len)
+    OggPage(page, headerbuf, bodybuf)
+end
+
+# function show(io::IO, x::OggPage)
+#     write(io, "OggPage ID: $(ogg_page_serialno(x)), length $(x.body_len) bytes")
+# end
 
 """
     eachpage(dec::OggDecoder; copy=true)
@@ -79,30 +133,33 @@ end
 const READ_CHUNK_SIZE = 4096
 
 """
-    readpage(dec::OggDecoder)::Nullable{OggPage}
+    readpage(dec::OggDecoder; copy=true)::Union{OggPage, Nothing}
 
-Read the next page from the ogg decoder. Returns the nullable-wrapped page,
-which is null if there are no more pages. This function will block the task if
-it needs to wait to read from the underlying IO stream.
+Read the next page from the ogg decoder. Returns the page, or `nothing` if there
+are no more pages (all logical streams have ended or the physical stream has hit
+EOF) This function will block the task if it needs to wait to read from the
+underlying IO stream.
+
+If `copy` is `false` than the data the `OggPage` points to
 """
-function readpage(dec::OggDecoder)
+function readpage(dec::OggDecoder; copy=true)
     # first check to see if there's already a page ready
-    page = ogg_sync_pageout(dec)
-    if !isnull(page)
-        return page
-    end
+    syncref = Ref(dec.syncstate)
+    page = ogg_sync_pageout(syncref)
+    page !== nothing && return OggPage(page; copy=copy)
+
     # no pages ready, so read more data until we get one
     while !eof(dec.io)
-        buffer = ogg_sync_buffer(dec, READ_CHUNK_SIZE)
+        buffer = ogg_sync_buffer(syncref, READ_CHUNK_SIZE)
         bytes_read = readbytes!(dec.io, buffer, READ_CHUNK_SIZE)
-        ogg_sync_wrote(dec, bytes_read)
-        page = ogg_sync_pageout(dec)
-        if !isnull(page)
-            return page
-        end
+        ogg_sync_wrote(syncref, bytes_read)
+        page = ogg_sync_pageout(syncref)
+
+        page !== nothing && return OggPage(page; copy=copy)
     end
+
     # we hit EOF without reading a page
-    return Nullable{OggPage}()
+    return nothing
 end
 
 # currently frankensteined from the old PageSink, not tested, just a place
