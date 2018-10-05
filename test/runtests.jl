@@ -83,6 +83,12 @@ using Compat.Test
         @test serial(pages[1]) == 1238561138
     end
 
+    OggDecoder(joinpath(@__DIR__, "zero.ogg")) do dec
+        strs = streams(dec)
+        @test length(strs) == 1
+        @test eltype(strs) == Cint
+        @test strs[1] == 1238561138
+    end
 
     # # There is only one stream, and we know its serial number
     # @test collect(keys(ogg_packets)) == [1238561138]

@@ -1,14 +1,15 @@
 __precompile__()
 module Ogg
 
-export OggDecoder, OggPage
-export eachpage, readpage, serial, bos, eos
-
 # using FileIO
 # import Base: show, convert
 # export OggDecoder, OggEncoder, OggPage
 # export serial, eos, bos
 # export eachpage
+
+export OggDecoder, OggLogicalStream, OggPage
+export streams, eachpage, readpage
+export serial, bos, eos
 
 const depfile = joinpath(@__DIR__, "..", "deps", "deps.jl")
 if isfile(depfile)
@@ -16,6 +17,9 @@ if isfile(depfile)
 else
     error("libogg not properly installed. Please run Pkg.build(\"Ogg\")")
 end
+
+# in almost every part of the API serial numbers are represented as ints.
+const SerialNum = Cint
 
 include("libogg.jl")
 include("decoder.jl")

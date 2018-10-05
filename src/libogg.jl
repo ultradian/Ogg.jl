@@ -49,7 +49,7 @@ ogg_sync_destroy should be used instead. In situations where the struct needs to
 be reset but the internal storage does not need to be freed, ogg_sync_reset
 should be used.
 """
-function ogg_sync_clear(sync::OggSyncState)
+function ogg_sync_clear(sync::Ref{OggSyncState})
     ccall((:ogg_sync_clear,libogg), Cint, (Ref{OggSyncState},), sync)
 end
 
@@ -116,10 +116,10 @@ struct OggStreamState
     # Exact position of decoding/encoding process
     granulepos::Int64
 
-    function OggStreamState()
+    function OggStreamState(serialno)
         streamstate = Ref(new())
         status = ccall((:ogg_stream_init,libogg), Cint,
-                       (Ref{OggStreamState}, Cint), streamstate, serial)
+                       (Ref{OggStreamState}, Cint), streamstate, serialno)
         if status != 0
             error("ogg_stream_init() failed with status $status")
         end
@@ -133,7 +133,7 @@ This function clears and frees the internal memory used by the ogg_stream_state
 struct, but does not free the structure itself. It is safe to call
 ogg_stream_clear on the same structure more than once.
 """
-function ogg_stream_clear(stream::OggStreamState)
+function ogg_stream_clear(stream::Ref{OggStreamState})
     ccall((:ogg_stream_clear,libogg), Cint, (Ref{OggStreamState},), stream)
 end
 
@@ -262,7 +262,7 @@ end
 Returns the serial number of the given page
 """
 function ogg_page_serialno(page::RawOggPage)
-    return Clong(ccall((:ogg_page_serialno,libogg), Cint, (Ref{RawOggPage},), page))
+    return ccall((:ogg_page_serialno,libogg), Cint, (Ref{RawOggPage},), page)
 end
 
 """

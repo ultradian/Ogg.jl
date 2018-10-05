@@ -26,7 +26,7 @@ open("filename.ogg") do phystream
     # Wrap the stream in an OggDecoder
     OggDecoder(phystream) do oggdec
         # open the 1st logical stream
-        open(streams(oggdec)[1]) do logstream
+        open(oggdec, streams(oggdec)[1]) do logstream
             # collect packets using the eachpacket iterator
             collect(eachpacket(logstream))
         end
@@ -53,7 +53,7 @@ The images [here](https://xiph.org/ogg/doc/oggstream.html) are useful for visual
 
 The `OggDecoder` type decodes a physical bitstream (from disk, or a network connection, etc.). `readpage(::OggDecoder)` will give you the next page.
 
-`streams(::OggDecoder)` returns a list of all the logical streams contained in the Ogg file. Each logical stream is represented by an `OggLogicalStream`. You must call `open` on the stream before you can start reading from it.
+`streams(::OggDecoder)` returns a list of all the logical streams serial numbers contained in the Ogg file. Calling `open(oggdec, serialno)` will create an `OggLogicalStream` that you can read pages or packets from.
 
 Rather than (or in addition to) using `readpage` you can also iterate through the pages using the `eachpage(::OggDecoder)` and `eachpage(::OggLogicalStream)` methods (to get the pages of the physical and elementary bitstreams, respectively). See the `eachpage` function documentation for more information and performance tips. These iterators do not seek to the beginning of the underlying stream, so if you have already read some pages they will iterate through the _remaining_ pages. More commonly you'll be interested in the packets that can decoded by a codec into the audio or video content.
 
@@ -90,8 +90,8 @@ So opening a (possibly chained) Ogg file with two streams and processing their p
 open("filename.ogg") do phystream
     while !eof(phystream)
         OggDecoder(phystream) do oggdec
-            logstream1 = open(streams(oggdec)[1])
-            logstream2 = open(streams(oggdec)[2])
+            logstream1 = open(oggdec, streams(oggdec)[1])
+            logstream2 = open(oggdec, streams(oggdec)[2])
             @sync begin
                 @async for packet in eachpacket(logstream1)
                     # handle the packet
@@ -113,8 +113,8 @@ Alternatively you can use `do` syntax to close the stream automatically, though 
 open("filename.ogg") do phystream
     while !eof(phystream)
         OggDecoder(phystream) do oggdec
-            open(streams(oggdec)[1]) do logstream1
-                open(streams(oggdec)[2]) do logstream2
+            open(oggdec, streams(oggdec)[1]) do logstream1
+                open(oggdec, streams(oggdec)[2]) do logstream2
                     @sync
                         @async for packet in eachpacket(logstream1)
                             # handle the packet

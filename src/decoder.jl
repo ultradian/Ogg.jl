@@ -1,59 +1,4 @@
 """
-    OggDecoder(io::IO, own=false)
-    OggDecoder(fname::AbstractString)
-    OggDecoder(fn::Function, io::IO; own=false)
-    OggDecoder(fn::Function, fname::AbstractString)
-
-Decodes an Ogg file given by a stream or filename. If opened with a stream, the
-`own` argument determines whether the decoder will handle closing the
-underlying stream when it is closed. You can also use `do` syntax (with either
-a stream or a filename) to to run a block of code, and the decoder will handle
-closing itself afterwards. Otherwise the user is responsible for calling `close`
-on the decoder when you are finished with it.
-
-Note that opening an `OggDecoder` will automatically consume the initial `BOS`
-page(s) in the physical stream, so that it can build a list of logical streams.
-
-Closing the decoder will also close any open logical streams.
-"""
-mutable struct OggDecoder{T<:IO}
-    io::T
-    ownstream::Bool
-    syncstate::OggSyncState
-    streams::Dict{Clong,OggStreamState}
-end
-
-function OggDecoder(io::IO; own=false)
-    sync = OggSyncState()
-
-    OggDecoder(io, own, sync, Dict{Clong, OggStreamState}())
-end
-
-OggDecoder(fname::AbstractString) = OggDecoder(open(fname); own=true)
-
-# handle do syntax. this works whether io is a stream or file
-function OggDecoder(f::Function, io; kwargs...)
-    dec = OggDecoder(io; kwargs...)
-    try
-        f(dec)
-    finally
-        close(dec)
-    end
-end
-
-function Base.close(dec::OggDecoder)
-    # for stream in streams(dec)
-    #     isopen(stream) && close(stream)
-    # end
-    if dec.ownstream
-        close(dec.io)
-    end
-    ogg_sync_clear(dec.syncstate)
-
-    nothing
-end
-
-"""
 The OggPage struct encapsulates the data for an Ogg page.
 
 Ogg pages are the fundamental unit of framing and interleave in an ogg
@@ -100,9 +45,111 @@ function Base.deepcopy(page::OggPage)
     OggPage(page, headerbuf, bodybuf)
 end
 
-# function show(io::IO, x::OggPage)
-#     write(io, "OggPage ID: $(ogg_page_serialno(x)), length $(x.body_len) bytes")
-# end
+function show(io::IO, x::OggPage)
+    write(io, "OggPage ID: $(serial(x)), body: $(x.page.body_len) bytes")
+end
+
+# currently frankensteined from the old PageSink, not tested, just a place
+# to put that code in case it's useful
+"""
+    OggLogicalStream(container, serialnum)
+
+Represents a logical bitstream within a physical bitstream.
+"""
+# TODO: confirm we need multiple states rather than an `opened` Bool
+# parametric to break circular type definition. T should be an OggDecoder
+struct OggLogicalStream{T}
+    state::Symbol # :init, :opened, :reading, :closed
+    streamstate::OggStreamState
+    serial::SerialNum
+    container::T
+
+    OggLogicalStream{T}(container, serialnum) where T =
+        new(:init, OggStreamState(serialnum), serialnum, container)
+end
+
+OggLogicalStream(container::T, serialnum) where T =
+    OggLogicalStream{T}(container, serialnum)
+
+function Base.open(stream::OggLogicalStream)
+    stream.state = :opened
+end
+
+function Base.close(stream::OggLogicalStream)
+    stream.state = :closed
+    ogg_stream_clear(Ref(stream.streamstate))
+end
+
+"""
+    OggDecoder(io::IO, own=false)
+    OggDecoder(fname::AbstractString)
+    OggDecoder(fn::Function, io::IO; own=false)
+    OggDecoder(fn::Function, fname::AbstractString)
+
+Decodes an Ogg file given by a stream or filename. If opened with a stream, the
+`own` argument determines whether the decoder will handle closing the
+underlying stream when it is closed. You can also use `do` syntax (with either
+a stream or a filename) to to run a block of code, and the decoder will handle
+closing itself afterwards. Otherwise the user is responsible for calling `close`
+on the decoder when you are finished with it.
+
+Note that opening an `OggDecoder` will automatically consume the initial `BOS`
+page(s) in the physical stream, so that it can build a list of logical streams.
+
+Closing the decoder will also close any open logical streams.
+"""
+mutable struct OggDecoder{T<:IO}
+    io::T
+    ownstream::Bool
+    syncstate::OggSyncState
+    logstreams::Dict{SerialNum, OggLogicalStream}
+    pagebuf::Vector{OggPage}
+end
+
+function OggDecoder(io::IO; own=false)
+    sync = OggSyncState()
+
+    dec = OggDecoder(io, own, sync, Dict{SerialNum, OggLogicalStream}(), OggPage[])
+    # scan through all the pages with the BOS flag (they should all be at the
+    # beginning) so we know what serials we're dealing with. We add them to the
+    # pagebuf so they're still available to users
+    page = _readpage(dec)
+    page !== nothing && push!(dec.pagebuf, page)
+    while page !== nothing && bos(page)
+        ser = serial(page)
+        dec.logstreams[ser] = OggLogicalStream(dec, ser)
+        page = _readpage(dec)
+        page !== nothing && push!(dec.pagebuf, page)
+    end
+
+    dec
+end
+
+OggDecoder(fname::AbstractString) = OggDecoder(open(fname); own=true)
+
+# handle do syntax. this works whether io is a stream or file
+function OggDecoder(f::Function, io; kwargs...)
+    dec = OggDecoder(io; kwargs...)
+    try
+        f(dec)
+    finally
+        close(dec)
+    end
+end
+
+function Base.close(dec::OggDecoder)
+    # for stream in streams(dec)
+    #     isopen(stream) && close(stream)
+    # end
+    if dec.ownstream
+        close(dec.io)
+    end
+    ogg_sync_clear(Ref(dec.syncstate))
+
+    nothing
+end
+
+streams(dec::OggDecoder) = collect(keys(dec.logstreams))
 
 """
     eachpage(dec::OggDecoder; copy=true)
@@ -142,6 +189,16 @@ underlying IO stream.
 If `copy` is `false` than the data the `OggPage` points to
 """
 function readpage(dec::OggDecoder; copy=true)
+    # first see if we have any pages in the queue
+    !isempty(dec.pagebuf) && return popfirst!(dec.pagebuf)
+
+    _readpage(dec, copy)
+end
+
+"""
+Internal page read function that ignores the julia-side page queue
+"""
+function _readpage(dec::OggDecoder, copy::Bool=true)
     # first check to see if there's already a page ready
     syncref = Ref(dec.syncstate)
     page = ogg_sync_pageout(syncref)
@@ -161,36 +218,6 @@ function readpage(dec::OggDecoder; copy=true)
     return nothing
 end
 
-# currently frankensteined from the old PageSink, not tested, just a place
-# to put that code in case it's useful
-struct OggLogicalStream
-    state::OggStreamState
-    serial::Cint
-    container::OggDecoder
-
-    OggLogicalStream(container, serial) = stream = new(OggStreamState(), serial, container)
-end
-
-function Base.open(stream::OggLogicalStream)
-    open_logical_stream(stream.container, stream)
-end
-
-# note it's a little weird that we pass the stream as an argument to the given
-# function, given that the context already has a reference. Seems worth it for
-# consistency with other open... functions though. The thing that makes
-# OggLogicalStream weird is that it starts in a closed state.
-function Base.open(fn::Function, stream::OggLogicalStream)
-    open(stream)
-    try
-        fn(stream)
-    finally
-        close(stream)
-    end
-end
-
-function Base.close(stream::OggLogicalStream)
-    close_logical_stream(stream.container, stream)
-end
 
 """
     readpage(stream::OggLogicalStream)
