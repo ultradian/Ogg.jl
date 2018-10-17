@@ -6,6 +6,8 @@ module Ogg
 # export OggDecoder, OggEncoder, OggPage
 # export serial, eos, bos
 # export eachpage
+export OggEncoder
+export save
 
 export OggDecoder, OggLogicalStream, OggPage
 export streams, eachpage, readpage

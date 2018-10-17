@@ -2,6 +2,11 @@
 # provides some thin convenience wrappers but matches the same basic API as
 # libogg
 
+# When the libogg function modifies a variable by reference, the wrapper will
+# take the (immutable) value as an argument and return the updated value. This
+# way the caller doesn't have to worry about getting the reference juggling
+# correct.
+
 # docstrings are mostly copied from https://xiph.org/ogg/doc/libogg/reference.html
 
 # These types all shadow libogg datatypes, hence they are all immutable
@@ -48,9 +53,14 @@ and resets the struct to the initial state. To free the entire struct,
 ogg_sync_destroy should be used instead. In situations where the struct needs to
 be reset but the internal storage does not need to be freed, ogg_sync_reset
 should be used.
+
+Returns the reset OggSyncState object.
 """
-function ogg_sync_clear(sync::Ref{OggSyncState})
-    ccall((:ogg_sync_clear,libogg), Cint, (Ref{OggSyncState},), sync)
+function ogg_sync_clear(sync::OggSyncState)
+    syncref = Ref(sync)
+    ccall((:ogg_sync_clear,libogg), Cint, (Ref{OggSyncState},), syncref)
+
+    syncref[]
 end
 
 struct RawOggPage
@@ -67,8 +77,12 @@ end
 # zero-constructor
 RawOggPage() = RawOggPage(C_NULL, 0, C_NULL, 0)
 
-# This const here so that we don't use ... syntax in new()
-const oss_zero_header = tuple(zeros(UInt8, 282)...)
+function Base.:(==)(x::RawOggPage, y::RawOggPage)
+    x.header_len == y.header_len &&
+    x.body_len == y.body_len &&
+    unsafe_wrap(Array, x.header, x.header_len) == unsafe_wrap(Array, y.header, y.header_len) &&
+    unsafe_wrap(Array, x.body, x.body_len) == unsafe_wrap(Array, y.body, y.body_len)
+end
 
 """
 The ogg_stream_state struct tracks the current encode/decode state of the
@@ -116,7 +130,7 @@ struct OggStreamState
     # Exact position of decoding/encoding process
     granulepos::Int64
 
-    function OggStreamState(serialno)
+    function OggStreamState(serialno::Integer)
         streamstate = Ref(new())
         status = ccall((:ogg_stream_init,libogg), Cint,
                        (Ref{OggStreamState}, Cint), streamstate, serialno)
@@ -133,8 +147,11 @@ This function clears and frees the internal memory used by the ogg_stream_state
 struct, but does not free the structure itself. It is safe to call
 ogg_stream_clear on the same structure more than once.
 """
-function ogg_stream_clear(stream::Ref{OggStreamState})
-    ccall((:ogg_stream_clear,libogg), Cint, (Ref{OggStreamState},), stream)
+function ogg_stream_clear(stream::OggStreamState)
+    streamref = Ref(stream)
+    ccall((:ogg_stream_clear,libogg), Cint, (Ref{OggStreamState},), streamref)
+
+    streamref[]
 end
 
 struct OggPacket
@@ -164,7 +181,7 @@ function show(io::IO, x::OggPacket)
 end
 
 """
-    ogg_sync_buffer(dec::Ref{OggSyncState}, size)
+    ogg_sync_buffer(dec::OggSyncState, size)
 
 Provide a buffer for writing new raw data into from the physical bitstream.
 
@@ -183,14 +200,16 @@ After copying data into this buffer you should call `ogg_sync_wrote` to tell the
 `OggSyncState` struct how many bytes were actually written, and update the
 fill mark.
 
-Returns an `Array` wrapping the provided buffer.
+Returns an `Array` wrapping the provided buffer and the new `OggSyncState`
+value.
 
 (docs adapted from https://xiph.org/ogg/doc/libogg/ogg_sync_buffer.html)
 """
-function ogg_sync_buffer(syncstate::Ref{OggSyncState}, size)
+function ogg_sync_buffer(syncstate::OggSyncState, size)
+    syncref = Ref(syncstate)
     buffer = ccall((:ogg_sync_buffer,libogg), Ptr{UInt8},
                    (Ref{OggSyncState}, Clong),
-                   syncstate, size)
+                   syncref, size)
     if buffer == C_NULL
         error("ogg_sync_buffer() failed: returned buffer NULL")
     end
@@ -198,11 +217,11 @@ function ogg_sync_buffer(syncstate::Ref{OggSyncState}, size)
     # note that the Array doesn't own the data, it will not be freed by Julia
     # when the array goes out of scope (which is what we want, because libogg
     # owns the data)
-    return unsafe_wrap(Array, buffer, size)
+    unsafe_wrap(Array, buffer, size), syncref[]
 end
 
 """
-    ogg_sync_wrote(dec::Ref{OggSyncState}, size)
+    ogg_sync_wrote(dec::OggSyncState, size)
 
 Tell the OggSyncState struct how many bytes we wrote into the buffer.
 
@@ -213,20 +232,23 @@ The general proceedure is to request a pointer into an internal ogg_sync_state
 buffer by calling ogg_sync_buffer(). The buffer is then filled up to the
 requested size with new input, and ogg_sync_wrote() is called to advance the
 fill pointer by however much data was actually written.
+
+Returns the new `OggSyncState` value.
 """
-function ogg_sync_wrote(syncstate::Ref{OggSyncState}, size)
+function ogg_sync_wrote(syncstate::OggSyncState, size)
+    syncref = Ref(syncstate)
     status = ccall((:ogg_sync_wrote, libogg), Cint,
                    (Ref{OggSyncState}, Clong),
-                   syncstate, size)
+                   syncref, size)
     if status != 0
         error("ogg_sync_wrote() failed: error code $status")
     end
 
-    nothing
+    syncref[]
 end
 
 """
-    ogg_sync_pageout(syncstate::Ref{OggSyncState})::Union{RawOggPage, Nothing}
+    ogg_sync_pageout(syncstate::OggSyncState)
 
 Takes the data stored in the buffer of the OggSyncState and inserts them into an
 ogg_page. Note that the payload data in the page is not copied, so the memory
@@ -240,19 +262,20 @@ that data does not remain in the OggSyncState struct. Failing to do so may
 result in a memory leak. See the example code below for details.
 
 Returns a new RawOggPage if it was available, or nothing if not (more data is
-needed).
+needed). Also returns the updated `OggSyncState` value.
 
 (docs adapted from https://xiph.org/ogg/doc/libogg/ogg_sync_pageout.html)
 """
-function ogg_sync_pageout(syncstate::Ref{OggSyncState})
+function ogg_sync_pageout(syncstate::OggSyncState)
+    syncref = Ref(syncstate)
     page = Ref(RawOggPage())
     status = ccall((:ogg_sync_pageout,libogg), Cint,
                    (Ref{OggSyncState}, Ref{RawOggPage}),
-                   syncstate, page)
+                   syncref, page)
     if status == 1
-        return page[]
+        return page[], syncref[]
     else
-        return nothing
+        return nothing, syncref[]
     end
 end
 

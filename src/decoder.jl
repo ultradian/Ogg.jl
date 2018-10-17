@@ -45,8 +45,21 @@ function Base.deepcopy(page::OggPage)
     OggPage(page, headerbuf, bodybuf)
 end
 
-function show(io::IO, x::OggPage)
+function Base.convert(::Type{Vector{UInt8}}, page::OggPage)
+    GC.@preserve page begin
+        header_arr = unsafe_wrap(Array, page.page.header, page.page.header_len)
+        body_arr = unsafe_wrap(Array, page.page.body, page.page.body_len)
+        return vcat(header_arr, body_arr)
+    end
+end
+
+function Base.show(io::IO, x::OggPage)
     write(io, "OggPage ID: $(serial(x)), body: $(x.page.body_len) bytes")
+end
+
+function Base.:(==)(x::OggPage, y::OggPage)
+    # we'll just compare the data inside, we don't care where it's located
+    return x.page == y.page
 end
 
 # currently frankensteined from the old PageSink, not tested, just a place
@@ -56,29 +69,30 @@ end
 
 Represents a logical bitstream within a physical bitstream.
 """
-# TODO: confirm we need multiple states rather than an `opened` Bool
 # parametric to break circular type definition. T should be an OggDecoder
-struct OggLogicalStream{T}
-    state::Symbol # :init, :opened, :reading, :closed
+mutable struct OggLogicalStream{T}
     streamstate::OggStreamState
     serial::SerialNum
     container::T
 
     OggLogicalStream{T}(container, serialnum) where T =
-        new(:init, OggStreamState(serialnum), serialnum, container)
+        new(OggStreamState(serialnum), serialnum, container)
 end
 
 OggLogicalStream(container::T, serialnum) where T =
     OggLogicalStream{T}(container, serialnum)
 
-function Base.open(stream::OggLogicalStream)
-    stream.state = :opened
+function Base.show(io::IO, str::OggLogicalStream)
+    print(io, "OggLogicalStream with serial $(str.serial)")
 end
 
-function Base.close(stream::OggLogicalStream)
-    stream.state = :closed
-    ogg_stream_clear(Ref(stream.streamstate))
+# the type parameter is not actually used parametrically, so don't display it
+function Base.show(io::IO, ::Type{OggLogicalStream{T}}) where T
+    print(io, "OggLogicalStream")
 end
+
+# aliased for convenience
+const LogStreamDict = Dict{SerialNum, Union{Vector{OggPage}, Nothing}}
 
 """
     OggDecoder(io::IO, own=false)
@@ -102,25 +116,32 @@ mutable struct OggDecoder{T<:IO}
     io::T
     ownstream::Bool
     syncstate::OggSyncState
-    logstreams::Dict{SerialNum, OggLogicalStream}
-    pagebuf::Vector{OggPage}
+    # logstreams keeps a buffer for each opened logical stream. If the decoder
+    # encounters pages for one stream while looking for those of another, it
+    # will save those pages in their respective buffer (if that stream has been
+    # opened). a value of `nothing` means the logical stream exists but is not
+    # opened
+    logstreams::LogStreamDict
+    bospages::Vector{OggPage}
 end
 
 function OggDecoder(io::IO; own=false)
     sync = OggSyncState()
 
-    dec = OggDecoder(io, own, sync, Dict{SerialNum, OggLogicalStream}(), OggPage[])
+    dec = OggDecoder(io, own, sync, LogStreamDict(), OggPage[])
     # scan through all the pages with the BOS flag (they should all be at the
     # beginning) so we know what serials we're dealing with. We add them to the
-    # pagebuf so they're still available to users
+    # bospages `Vector` so they're still available to users
     page = _readpage(dec)
-    page !== nothing && push!(dec.pagebuf, page)
+    page === nothing || push!(dec.bospages, page)
     while page !== nothing && bos(page)
-        ser = serial(page)
-        dec.logstreams[ser] = OggLogicalStream(dec, ser)
+        dec.logstreams[serial(page)] = nothing
         page = _readpage(dec)
-        page !== nothing && push!(dec.pagebuf, page)
+        page !== nothing && push!(dec.bospages, page)
     end
+
+    # we end up with one extra page (the first one after the BOS pages) in
+    # the buffer, but it gets read out correctly later
 
     dec
 end
@@ -144,28 +165,68 @@ function Base.close(dec::OggDecoder)
     if dec.ownstream
         close(dec.io)
     end
-    ogg_sync_clear(Ref(dec.syncstate))
+    dec.syncstate = ogg_sync_clear(dec.syncstate)
 
     nothing
+end
+
+"""
+    open(dec::OggDecoder, ser::SerialNum)
+    open(f::Function, dec::OggDecoder, ser::SerialNum)
+
+Open a logical stream identified with the given serial number. Returns an
+`OggLogicalStream` object that you can read pages and packets from. The logical
+stream should be closed with `close(stream)`, or you can use `do` syntax to
+ensure that it is closed automatically.
+"""
+function Base.open(dec::OggDecoder, str::SerialNum)
+    dec.logstreams[str] = OggPage[]
+
+    OggLogicalStream(dec, str)
+end
+
+function Base.open(fn::Function, dec::OggDecoder, str::SerialNum)
+    stream = open(dec, str)
+    try
+        fn(stream)
+    finally
+        close(stream)
+    end
+end
+
+function Base.close(stream::OggLogicalStream)
+    stream.container.logstreams[stream.serial] = nothing
+    stream.streamstate = ogg_stream_clear(stream.streamstate)
+end
+
+function Base.show(io::IO, dec::OggDecoder)
+    strs = streams(dec)
+    plural = length(strs) == 1 ? "" : "s"
+    println(io, "OggDecoder($(dec.io)")
+    print(io,   "  $(length(strs)) logical stream$plural with serial$plural:")
+    for str in strs
+        print.("\n    $str")
+    end
 end
 
 streams(dec::OggDecoder) = collect(keys(dec.logstreams))
 
 """
     eachpage(dec::OggDecoder; copy=true)
+    eachpage(dec::OggLogicalStream; copy=true)
 
 Returns an iterator you can use to get the pages from an ogg physical bitstream.
 If you pass the `copy=false` keyword argument then the page will point to data
 within the decoder buffer, and is only valid until the next page is provided.
 """
-eachpage(dec::OggDecoder; copy=true) = OggPageIterator(dec, copy)
+eachpage(dec; copy=true) = OggPageIterator(dec, copy)
 
-struct OggPageIterator
-    dec::OggDecoder
+struct OggPageIterator{T}
+    dec::T
     copy::Bool
 end
 
-Base.IteratorSize(::Type{OggPageIterator}) = Base.SizeUnknown()
+Base.IteratorSize(::Type{OggPageIterator{T}}) where T = Base.SizeUnknown()
 Base.eltype(::OggPageIterator) = OggPage
 
 function Base.iterate(i::OggPageIterator, state=nothing)
@@ -190,26 +251,25 @@ If `copy` is `false` than the data the `OggPage` points to
 """
 function readpage(dec::OggDecoder; copy=true)
     # first see if we have any pages in the queue
-    !isempty(dec.pagebuf) && return popfirst!(dec.pagebuf)
+    isempty(dec.bospages) || return popfirst!(dec.bospages)
 
     _readpage(dec, copy)
 end
 
 """
-Internal page read function that ignores the julia-side page queue
+Internal page read function that ignores the julia-side BOS page queue
 """
 function _readpage(dec::OggDecoder, copy::Bool=true)
     # first check to see if there's already a page ready
-    syncref = Ref(dec.syncstate)
-    page = ogg_sync_pageout(syncref)
+    page, dec.syncstate = ogg_sync_pageout(dec.syncstate)
     page !== nothing && return OggPage(page; copy=copy)
 
     # no pages ready, so read more data until we get one
     while !eof(dec.io)
-        buffer = ogg_sync_buffer(syncref, READ_CHUNK_SIZE)
+        buffer, dec.syncstate = ogg_sync_buffer(dec.syncstate, READ_CHUNK_SIZE)
         bytes_read = readbytes!(dec.io, buffer, READ_CHUNK_SIZE)
-        ogg_sync_wrote(syncref, bytes_read)
-        page = ogg_sync_pageout(syncref)
+        dec.syncstate = ogg_sync_wrote(dec.syncstate, bytes_read)
+        page, dec.syncstate = ogg_sync_pageout(dec.syncstate)
 
         page !== nothing && return OggPage(page; copy=copy)
     end
@@ -218,85 +278,90 @@ function _readpage(dec::OggDecoder, copy::Bool=true)
     return nothing
 end
 
+"""
+    readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
+
+Reads a page from the given logical stream within the decoder. If the decoder
+encounters pages for other opened logical streams it will buffer them.
+"""
+function readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
+    if !(serialnum in keys(dec.logstreams))
+        throw(ErrorException("OggDecoder error - stream must be opened before reading"))
+    end
+    # first see if we have any pages in the queue
+    pagebuf = dec.logstreams[serialnum]
+    isempty(pagebuf) || return popfirst!(pagebuf)
+    page = readpage(dec, copy=false)
+    while page !== nothing && serial(page) != serialnum
+        # this is not the page we're looking for buffer it if we have an open
+        # logical stream for it
+        pageserial = serial(page)
+        if pageserial in keys(dec.logstreams)
+            # we're storing the page in the queue, so we need to copy the data
+            # even if the user didn't request their page to be copied
+            push!(dec.logstreams[pageserial], deepcopy(page))
+        end
+        page = readpage(dec, copy=false)
+    end
+
+    copy ? deepcopy(page) : page
+end
 
 """
-    readpage(stream::OggLogicalStream)
+    readpage(stream::OggLogicalStream; copy=true)
 
 Read a page from the given logical stream.
 """
-readpage(stream::OggLogicalStream) = readpage(stream.container, stream.serial)
+readpage(stream::OggLogicalStream; copy=true) = readpage(stream.container, stream.serial; copy=copy)
 
-"""
-    readpacket(stream::OggLogicalStream)
+# """
+#     readpacket(stream::OggLogicalStream)
+#
+# Read a packet from the given logical stream.
+# """
+# function readpacket(stream::OggLogicalStream)
+#     # TODO: check here if we actually need to read a new page
+#         nextpage = readpage(stream)
+#         ogg_stream_pagein(sink.streamstate, nextpage)
+#     # TODO: read out the next packet
+# end
 
-Read a packet from the given logical stream.
-"""
-function readpacket(stream::OggLogicalStream)
-    # TODO: check here if we actually need to read a new page
-        nextpage = readpage(stream)
-        ogg_stream_pagein(sink.streamstate, nextpage)
-    # TODO: read out the next packet
-end
-
-function decode_all_pages(dec::OggDecoder, enc_io::IO; chunk_size::Integer = 4096)
-    # Load data in until we have a page to sync out
-    while !eof(enc_io)
-        page = ogg_sync_pageout(dec)
-        while page != nothing
-            ogg_stream_pagein(dec, page)
-            page = ogg_sync_pageout(dec)
-        end
-
-        # Load in up to `chunk_size` of data, unless the stream closes before that
-        buffer = ogg_sync_buffer(dec, chunk_size)
-        bytes_read = readbytes!(enc_io, buffer, chunk_size)
-        ogg_sync_wrote(dec, bytes_read)
-    end
-
-    # Do our last pageouts to get the last pages
-    page = ogg_sync_pageout(dec)
-    while page != nothing
-        ogg_stream_pagein(dec, page)
-        page = ogg_sync_pageout(dec)
-    end
-end
-
-"""
-File goes in, packets come out
-"""
-function decode_all_packets(dec::OggDecoder, enc_io::IO)
-    # Now, decode all packets for these pages
-    for serial in keys(dec.streams)
-        packet = ogg_stream_packetout(dec, serial)
-        while packet != nothing
-            # This packet will soon go away, and we're unsafe_wrap'ing its data
-            # into an arry, so we make an explicit copy of that wrapped array,
-            # then push that into `dec.packets[]`
-            packet_data = copy(unsafe_wrap(Array, packet.packet, packet.bytes))
-            push!(dec.packets[serial], packet_data)
-
-            # If this was the last packet in this stream, delete the stream from
-            # the list of streams.  `ogg_stream_packetout()` should return `nothing`
-            # after this.  Note that if a stream just doesn't have more information
-            # available, it's possible for `ogg_stream_packetout()` to return `nothing`
-            # even without `packet.e_o_s == 1` being true.  In that case, we can come
-            # back through `decode_all_packets()` a second time to get more packets
-            # from the streams that have not ended.
-            if packet.e_o_s == 1
-                delete!(dec.streams, serial)
-            end
-
-            packet = ogg_stream_packetout(dec, serial)
-        end
-    end
-end
-
-function load(fio::IO; chunk_size=4096)
-    dec = OggDecoder()
-    decode_all_pages(dec, fio; chunk_size=chunk_size)
-    decode_all_packets(dec, fio)
-    return dec.packets
-end
+# """
+# File goes in, packets come out
+# """
+# function decode_all_packets(dec::OggDecoder, enc_io::IO)
+#     # Now, decode all packets for these pages
+#     for serial in keys(dec.streams)
+#         packet = ogg_stream_packetout(dec, serial)
+#         while packet != nothing
+#             # This packet will soon go away, and we're unsafe_wrap'ing its data
+#             # into an arry, so we make an explicit copy of that wrapped array,
+#             # then push that into `dec.packets[]`
+#             packet_data = copy(unsafe_wrap(Array, packet.packet, packet.bytes))
+#             push!(dec.packets[serial], packet_data)
+#
+#             # If this was the last packet in this stream, delete the stream from
+#             # the list of streams.  `ogg_stream_packetout()` should return `nothing`
+#             # after this.  Note that if a stream just doesn't have more information
+#             # available, it's possible for `ogg_stream_packetout()` to return `nothing`
+#             # even without `packet.e_o_s == 1` being true.  In that case, we can come
+#             # back through `decode_all_packets()` a second time to get more packets
+#             # from the streams that have not ended.
+#             if packet.e_o_s == 1
+#                 delete!(dec.streams, serial)
+#             end
+#
+#             packet = ogg_stream_packetout(dec, serial)
+#         end
+#     end
+# end
+#
+# function load(fio::IO; chunk_size=4096)
+#     dec = OggDecoder()
+#     decode_all_pages(dec, fio; chunk_size=chunk_size)
+#     decode_all_packets(dec, fio)
+#     return dec.packets
+# end
 
 # function load(file_path::Union{File{format"OGG"},AbstractString}; chunk_size=4096)
 #     open(file_path) do fio
