@@ -15,9 +15,12 @@ points to data within the `ogg_sync_state` struct. Here we create our own
 the libogg `ogg_page` struct. Remember to use `GC.@preserve` to make sure this
 object is retained during any `ccall`s that use the underlying `RawOggPage`
 struct.
+
+If the buffers are `nothing` than this packet does not carry its own memory with
+it.
 """
 struct OggPage
-    page::RawOggPage
+    rawpage::RawOggPage
     headerbuf::Union{Vector{UInt8}, Nothing}
     bodybuf::Union{Vector{UInt8}, Nothing}
 end
@@ -30,36 +33,108 @@ function OggPage(page::RawOggPage; copy=true)
     end
 end
 
-serial(page::OggPage) = ogg_page_serialno(page.page)
-bos(page::OggPage) = ogg_page_bos(page.page)
-eos(page::OggPage) = ogg_page_eos(page.page)
+serial(page::OggPage) = ogg_page_serialno(page.rawpage)
+bos(page::OggPage) = ogg_page_bos(page.rawpage)
+eos(page::OggPage) = ogg_page_eos(page.rawpage)
 
 function Base.deepcopy(page::OggPage)
-    headerbuf = Vector{UInt8}(undef, page.page.header_len)
-    unsafe_copyto!(pointer(headerbuf), page.page.header, page.page.header_len)
-    bodybuf = Vector{UInt8}(undef, page.page.body_len)
-    unsafe_copyto!(pointer(bodybuf), page.page.body, page.page.body_len)
+    headerbuf = Vector{UInt8}(undef, page.rawpage.header_len)
+    unsafe_copyto!(pointer(headerbuf), page.rawpage.header, page.rawpage.header_len)
+    bodybuf = Vector{UInt8}(undef, page.rawpage.body_len)
+    unsafe_copyto!(pointer(bodybuf), page.rawpage.body, page.rawpage.body_len)
 
-    page = RawOggPage(pointer(headerbuf), page.page.header_len,
-                    pointer(bodybuf), page.page.body_len)
-    OggPage(page, headerbuf, bodybuf)
+    rawpage = RawOggPage(pointer(headerbuf), page.rawpage.header_len,
+                         pointer(bodybuf), page.rawpage.body_len)
+    OggPage(rawpage, headerbuf, bodybuf)
 end
 
 function Base.convert(::Type{Vector{UInt8}}, page::OggPage)
     GC.@preserve page begin
-        header_arr = unsafe_wrap(Array, page.page.header, page.page.header_len)
-        body_arr = unsafe_wrap(Array, page.page.body, page.page.body_len)
+        header_arr = unsafe_wrap(Array, page.rawpage.header, page.rawpage.header_len)
+        body_arr = unsafe_wrap(Array, page.rawpage.body, page.rawpage.body_len)
         return vcat(header_arr, body_arr)
     end
 end
 
 function Base.show(io::IO, x::OggPage)
-    write(io, "OggPage ID: $(serial(x)), body: $(x.page.body_len) bytes")
+    write(io, "OggPage ID: $(serial(x)), body: $(x.rawpage.body_len) bytes")
 end
 
 function Base.:(==)(x::OggPage, y::OggPage)
     # we'll just compare the data inside, we don't care where it's located
-    return x.page == y.page
+    return x.rawpage == y.rawpage
+end
+
+
+"""
+Normally within libogg the `ogg_packet` struct doesn't carry its own memory, it
+points to data within the `ogg_stream_state` struct. Here we create our own
+`OggPacket` type that can hold data, and use `RawOggPacket` as the type that
+maps to the libogg `ogg_packet` struct. Remember to use `GC.@preserve` to make
+sure this object is retained during any `ccall`s that use the underlying
+`RawOggPacket` struct.
+
+If the buffer is `nothing` than this packet does not carry its own memory with
+it.
+"""
+struct OggPacket
+    rawpacket::RawOggPacket
+    buf::Union{Vector{UInt8}, Nothing}
+end
+
+function OggPacket(packet::RawOggPacket; copy=true)
+    if !copy
+        OggPacket(packet, nothing)
+    else
+        deepcopy(OggPacket(packet, copy=false))
+    end
+end
+
+bos(pkt::OggPacket) = pkt.rawpacket.b_o_s == 1
+eos(pkt::OggPacket) = pkt.rawpacket.e_o_s == 1
+Base.length(pkt::OggPacket) = pkt.rawpacket.bytes
+granulepos(pkt::OggPacket) = pkt.rawpacket.granulepos
+sequencenum(pkt::OggPacket) = pkt.rawpacket.packetno
+
+function Base.show(io::IO, x::OggPacket)
+    bosflag = bos(x) ? "BOS" : ""
+    eosflag = eos(x) ? "EOS" : ""
+    flagsep = (bos(x) && eos(x)) ? "|" : ""
+    flagend = (bos(x) || eos(x)) ? ", " : ""
+    flags = string(bosflag, flagsep, eosflag, flagend)
+    write(io,"OggPacket <$flags$(length(x)) bytes, granule: $(granulepos(x)), seq: $(packetno(x))>")
+end
+
+# define a more verbose multi-line display
+function Base.show(io::IO, ::MIME"text/plain", x::OggPacket)
+    write(io, """OggPacket
+                   sequence number: $(packetno(x))
+                   flags: BOS($(bos(x))) EOS($(eos(x)))
+                   granulepos: $(granulepos(x))
+                   length: $(length(x)) bytes
+              """)
+end
+
+# give a new OggPacket that carries all its own memory
+function Base.deepcopy(packet::OggPacket)
+    buf = Vector{UInt8}(undef, length(packet))
+    unsafe_copyto!(pointer(buf), packet.rawpacket.packet, length(packet))
+
+    rawpacket = RawOggPacket(pointer(buf), packet.rawpacket.bytes,
+                             packet.rawpacket.b_o_s, packet.rawpacket.e_o_s,
+                             packet.rawpacket.granulepos, packet.rawpacket.packetno)
+    OggPacket(rawpacket, buf)
+end
+
+function Base.convert(::Type{Vector{UInt8}}, packet::OggPacket)
+    GC.@preserve packet begin
+        unsafe_wrap(Array, packet.rawpacket.packet, length(packet))
+    end
+end
+
+function Base.:(==)(x::OggPacket, y::OggPacket)
+    # we'll just compare the data inside, we don't care where it's located
+    return x.rawpacket == y.rawpacket
 end
 
 # currently frankensteined from the old PageSink, not tested, just a place
@@ -74,9 +149,10 @@ mutable struct OggLogicalStream{T}
     streamstate::OggStreamState
     serial::SerialNum
     container::T
+    eos::Bool
 
     OggLogicalStream{T}(container, serialnum) where T =
-        new(OggStreamState(serialnum), serialnum, container)
+        new(OggStreamState(serialnum), serialnum, container, false)
 end
 
 OggLogicalStream(container::T, serialnum) where T =
@@ -247,7 +323,10 @@ are no more pages (all logical streams have ended or the physical stream has hit
 EOF) This function will block the task if it needs to wait to read from the
 underlying IO stream.
 
-If `copy` is `false` than the data the `OggPage` points to
+If `copy` is `false` then the OggPage will contain a pointer to data within the
+`dec`. This avoids the need to copy the data but the data will be
+overwritten on the next `readpage` call. Also if the `dec` is garbage-collected
+then the data will be invalid. Use `copy=false` with caution.
 """
 function readpage(dec::OggDecoder; copy=true)
     # first see if we have any pages in the queue
@@ -296,7 +375,7 @@ function readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
         # this is not the page we're looking for buffer it if we have an open
         # logical stream for it
         pageserial = serial(page)
-        if pageserial in keys(dec.logstreams)
+        if pageserial in keys(dec.logstreams) && dec.logstreams[pageserial] !== nothing
             # we're storing the page in the queue, so we need to copy the data
             # even if the user didn't request their page to be copied
             push!(dec.logstreams[pageserial], deepcopy(page))
@@ -312,19 +391,70 @@ end
 
 Read a page from the given logical stream.
 """
-readpage(stream::OggLogicalStream; copy=true) = readpage(stream.container, stream.serial; copy=copy)
+function readpage(stream::OggLogicalStream; copy=true)
+    stream.eos && return nothing
+    page = readpage(stream.container, stream.serial; copy=copy)
+    # if the page is the last in the stream than mark it so we know to stop
+    # reading
+    stream.eos = eos(page)
 
-# """
-#     readpacket(stream::OggLogicalStream)
-#
-# Read a packet from the given logical stream.
-# """
-# function readpacket(stream::OggLogicalStream)
-#     # TODO: check here if we actually need to read a new page
-#         nextpage = readpage(stream)
-#         ogg_stream_pagein(sink.streamstate, nextpage)
-#     # TODO: read out the next packet
-# end
+    page
+end
+
+"""
+    readpacket(stream::OggLogicalStream; copy=true)
+
+Read a packet from the given logical stream. If there is not enough data
+buffered this will cause a read to the underlying stream, which will yield the
+task.
+
+Returns the new packet (an `OggPacket`), or `nothing` if there are no more
+packets in the stream.
+
+If `copy` is `false` then the OggPage will contain a pointer to data within the
+`dec`. This avoids the need to copy the data but the data will be
+overwritten on the next `readpage` call. Also if the `dec` is garbage-collected
+then the data will be invalid. Use `copy=false` with caution.
+"""
+function readpacket(stream::OggLogicalStream; copy=true)
+    packet, stream.streamstate = ogg_stream_packetout(stream.streamstate)
+    while packet === nothing
+        # don't need to copy because we're immediately pushing into the
+        # streamstate
+        page = readpage(stream, copy=false)
+        # if the page is nothing than the logical stream is over
+        page === nothing && return nothing
+        stream.streamstate = ogg_stream_pagein(stream.streamstate, page.rawpage)
+        packet, stream.streamstate = ogg_stream_packetout(stream.streamstate)
+    end
+
+    packet = OggPacket(packet, copy=copy)
+    packet
+end
+
+"""
+    eachpacket(dec::OggLogicalStream; copy=true)
+
+Returns an iterator you can use to get the packets from an ogg physical bitstream.
+If you pass the `copy=false` keyword argument then the packet will point to data
+within the decoder buffer, and is only valid until the next packet is provided.
+"""
+eachpacket(dec; copy=true) = OggPacketIterator(dec, copy)
+
+struct OggPacketIterator
+    dec::OggLogicalStream
+    copy::Bool
+end
+
+Base.IteratorSize(::Type{OggPacketIterator}) = Base.SizeUnknown()
+Base.eltype(::OggPacketIterator) = OggPacket
+
+function Base.iterate(i::OggPacketIterator, state=nothing)
+    nextpacket = readpacket(i.dec, copy=i.copy)
+    nextpacket === nothing && return nothing
+
+    (nextpacket, nothing)
+end
 
 # """
 # File goes in, packets come out

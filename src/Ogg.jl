@@ -8,10 +8,11 @@ module Ogg
 # export eachpage
 export OggEncoder
 export save
-
 export OggDecoder, OggLogicalStream, OggPage
 export streams, eachpage, readpage
 export serial, bos, eos
+export OggPacket
+export readpacket, eachpacket, sequencenum, granulepos
 
 const depfile = joinpath(@__DIR__, "..", "deps", "deps.jl")
 if isfile(depfile)

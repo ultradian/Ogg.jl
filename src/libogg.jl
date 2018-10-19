@@ -85,8 +85,9 @@ function Base.:(==)(x::RawOggPage, y::RawOggPage)
 end
 
 """
-The ogg_stream_state struct tracks the current encode/decode state of the
-current logical bitstream.
+The OggStreamState struct tracks the current encode/decode state of the current
+logical bitstream, i.e. converting elementary stream pages into logical stream
+packets.
 """
 struct OggStreamState
     # Pointer to data from packet bodies
@@ -154,7 +155,7 @@ function ogg_stream_clear(stream::OggStreamState)
     streamref[]
 end
 
-struct OggPacket
+struct RawOggPacket
     # Pointer to the packet's data. This is treated as an opaque type by the ogg layer
     packet::Ptr{UInt8}
     # Indicates the size of the packet data in bytes. Packets can be of arbitrary size
@@ -174,24 +175,25 @@ struct OggPacket
     packetno::Int64
 end
 # zero-constructor
-OggPacket() = OggPacket(C_NULL, 0, 0, 0, 0, 0)
+RawOggPacket() = RawOggPacket(C_NULL, 0, 0, 0, 0, 0)
 
-function show(io::IO, x::OggPacket)
-    write(io,"OggPacket ID: $(x.packetno), length $(x.bytes) bytes")
+function Base.:(==)(x::RawOggPacket, y::RawOggPacket)
+    x.bytes == y.bytes &&
+    x.b_o_s == y.b_o_s &&
+    x.granulepos == y.granulepos &&
+    x.packetno == y.packetno &&
+    unsafe_wrap(Array, x.data, x.bytes) == unsafe_wrap(Array, y.data, y.bytes)
 end
 
 """
     ogg_sync_buffer(dec::OggSyncState, size)
 
-Provide a buffer for writing new raw data into from the physical bitstream.
+Request a buffer for writing new raw data into from the physical bitstream.
 
 Buffer space which has already been returned is cleared, and the buffer is
 extended as necessary by the `size` (in bytes) plus some additional bytes.
 Within the current implementation, an extra 4096 bytes are allocated, but
 applications should not rely on this additional buffer space.
-
-Note that the argument is a reference to the `OggSyncState` object, which is
-immutable to Julia but will be updated by libogg.
 
 The buffer exposed by this function is empty internal storage from the
 `OggSyncState` struct, beginning at the fill mark within the struct.
@@ -254,9 +256,6 @@ Takes the data stored in the buffer of the OggSyncState and inserts them into an
 ogg_page. Note that the payload data in the page is not copied, so the memory
 the RawOggPage points to is still contained within the OggSyncState struct.
 
-Note that the argument is a reference to the `OggSyncState` object, which is
-immutable to Julia but will be updated by libogg.
-
 Caution: This function should be called before reading into the buffer to ensure
 that data does not remain in the OggSyncState struct. Failing to do so may
 result in a memory leak. See the example code below for details.
@@ -306,35 +305,60 @@ function ogg_page_bos(page::RawOggPage)
     return ccall((:ogg_page_bos,libogg), Cint, (Ref{RawOggPage},), page) != 0
 end
 
-# """
-# Send a page in, return the serial number of the stream that we just decoded.
-#
-# This copies the data that the OggPage points to (contained within the
-# `ogg_sync_state` struct) into the `ogg_stream_state` struct.
-# """
-# function ogg_stream_pagein(streamref::Ref{OggStreamState}, page::OggPage)
-#     pageref = Ref(page)
-#     status = ccall((:ogg_stream_pagein,libogg), Cint,
-#                    (Ref{OggStreamState}, Ref{OggPage}), streamref, pageref)
-#     if status != 0
-#         error("ogg_stream_pagein() failed with status $status")
-#     end
-#     nothing
-# end
-#
-# # note that this doesn't actually copy the data into the packet, it just makes
-# # the packet point to the data within the stream
-# function ogg_stream_packetout(streamref::Ref{OggStreamState}, retry=false)
-#     packetref = Ref{OggPacket}(OggPacket())
-#     status = ccall((:ogg_stream_packetout,libogg), Cint,
-#                    (Ref{OggStreamState}, Ref{OggPacket}), streamref, packetref)
-#     if status == 1
-#         return packetref[]
-#     else
-#         # Is our status -1?  That means we're desynchronized and should try again, at least once
-#         if status == -1 && !retry
-#             return ogg_stream_packetout(dec, serial; retry = true)
-#         end
-#         return nothing
-#     end
-# end
+"""
+Send a page into the `OggStreamstate` decoder
+
+This copies the data that the `RawOggPage` points to (contained within the
+`ogg_sync_state` struct) into the `ogg_stream_state` struct.
+
+returns the updated streamstate
+"""
+function ogg_stream_pagein(streamstate::OggStreamState, page::RawOggPage)
+    @debug "ogg_stream_pagein (header: $(page.header_len), body: $(page.body_len))"
+    streamref = Ref(streamstate)
+    status = ccall((:ogg_stream_pagein,libogg), Cint,
+                   (Ref{OggStreamState}, Ref{RawOggPage}), streamref, page)
+    if status != 0
+        error("ogg_stream_pagein() failed with status $status")
+    end
+
+    streamref[]
+end
+
+"""
+This function assembles a data packet for output to the codec decoding engine.
+The data has already been submitted to the OggStreamState and broken into
+segments. Each successive call returns the next complete packet built from those
+segments.
+
+In a typical decoding situation, this should be used after calling
+ogg_stream_pagein() to submit a page of data to the bitstream.
+
+If the function returns 0, more data is needed and another page should be
+submitted. A positive return value indicates successful return of a packet.
+
+The returned packet is filled in with pointers to memory managed by the stream
+state and is only valid until the next call. The client must copy the packet
+data if a longer lifetime is required.
+
+Returns a pair of the packet and the new `streamstate`. The packet is a
+`RawOggPacket` or `nothing` if the there isn't enough data buffered yet.
+"""
+function ogg_stream_packetout(streamstate::OggStreamState, isretry=false)
+    streamref = Ref(streamstate)
+    packetref = Ref(RawOggPacket())
+    status = ccall((:ogg_stream_packetout,libogg), Cint,
+                   (Ref{OggStreamState}, Ref{RawOggPacket}), streamref, packetref)
+    if status == 1
+        packetref[], streamref[]
+    elseif status == 0
+        nothing, streamref[]
+    elseif status == -1 && !isretry
+        # Is our status -1?  That means we're desynchronized and should try one
+        # more time
+        ogg_stream_packetout(streamref[], true)
+    else
+        @warn "Got unexpected return value from ogg_stream_packetout: $status"
+        nothing, streamref[]
+    end
+end

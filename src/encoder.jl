@@ -34,12 +34,12 @@ function ogg_stream_packetin(enc::OggEncoder, serial::Clong, data::Vector{UInt8}
     end
 
     # Build ogg_packet structure
-    packet = OggPacket( pointer(data), length(data), packet_idx == 0,
+    packet = RawOggPacket( pointer(data), length(data), packet_idx == 0,
                         last_packet, granulepos, packet_idx )
 
     streamref = Ref(enc.streams[serial])
     packetref = Ref(packet)
-    status = ccall((:ogg_stream_packetin,libogg), Cint, (Ref{OggStreamState}, Ref{OggPacket}), streamref, packetref)
+    status = ccall((:ogg_stream_packetin,libogg), Cint, (Ref{OggStreamState}, Ref{RawOggPacket}), streamref, packetref)
     enc.streams[serial] = streamref[]
     if status == -1
         error("ogg_stream_packetin() failed: Unknown failure")

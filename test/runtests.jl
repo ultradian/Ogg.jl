@@ -28,7 +28,7 @@ using Test
 
     # Rewind to the beginning of this IOBuffer and load the packets back in
     seekstart(ogg_file)
-    pages = Dict{Int, Vector{OggPage}}()
+    readpages = Dict{Int, Vector{OggPage}}()
 
     # the streams are chained together serially, so just decode the right number
     # of links
@@ -38,7 +38,7 @@ using Test
     # require some architecture and API changes - I think we'll want to have a
     # single OggDecoder span all the links, so it can use the extra data it grabs
     # after one link to start the next one.
-    for _ in stream_ids[1:1]
+    # for _ in stream_ids
         OggDecoder(ogg_file) do oggdec
             strs = streams(oggdec)
             @test length(strs) == 1
@@ -46,36 +46,60 @@ using Test
             @test serialnum in stream_ids
 
             open(oggdec, serialnum) do logstream
-                pages[serialnum] = collect(eachpage(logstream))
+                readpages[serialnum] = collect(eachpage(logstream))
             end
         end
-    end
-    @test eof(ogg_file)
+    # end
+    # for now we don't hit the end of the stream because we're only using the
+    # first link
+    # @test eof(ogg_file)
 
-    for serialnum in keys(pages)
-        @test all(serial.(pages[serialnum]) .== serialnum)
-        page = pages[serialnum][1]
+    # now collect all the packets
+    seekstart(ogg_file)
+    readpackets = Dict{Int, Vector{OggPacket}}()
+    # see note above about why we're only reading the first link in the chain
+    # for _ in stream_ids
+        OggDecoder(ogg_file) do oggdec
+            serialnum = streams(oggdec)[1]
+
+            open(oggdec, serialnum) do logstream
+                # readpackets[serialnum] = collect(eachpacket(logstream))
+                readpackets[serialnum] = OggPacket[]
+                packet = readpacket(logstream)
+                while packet !== nothing
+                    push!(readpackets[serialnum], packet)
+                    packet = readpacket(logstream)
+                end
+            end
+        end
+    # end
+
+
+    for serialnum in keys(readpages)
+        @test all(serial.(readpages[serialnum]) .== serialnum)
+        page = readpages[serialnum][1]
 
         # Let's dig deeper; let's ensure that the first two pages had length equal to
         # our first two packets, proving that our header packets had their own pages:
-        @test page.page.body_len == length(packets[serialnum][1])
-        page = pages[serialnum][2]
-        @test page.page.body_len == length(packets[serialnum][2])
+        @test page.rawpage.body_len == length(packets[serialnum][1])
+        page = readpages[serialnum][2]
+        @test page.rawpage.body_len == length(packets[serialnum][2])
     end
 
+    for serialnum in keys(readpackets)
+        # Are the number of packets the same?
+        @test length(readpackets[serialnum]) == length(packets[serialnum])
 
-    # # Are the number of packets the same?
-    # for serial in stream_ids
-    #     @test length(dec.packets[serial]) == length(packets[serial])
-    # end
-    #
-    # # Are the contents of the packets the same?
-    # for serial in stream_ids
-    #     for packet_idx in 1:length(dec.packets[serial])
-    #         @test dec.packets[serial][packet_idx] == packets[serial][packet_idx]
-    #     end
-    # end
-
+        # Are the contents of the packets the same?
+        for packet_idx in 1:length(readpackets[serialnum])
+            packet = readpackets[serialnum][packet_idx]
+            @test sequencenum(packet) == packet_idx - 1
+            # TODO: for some reason bos and eos are always false here
+            # @test bos(packet) == (packet_idx == 1)
+            # @test eos(packet) == (packet_idx == length(readpackets[serialnum]))
+            @test convert(Vector{UInt8}, packet) == packets[serialnum][packet_idx]
+        end
+    end
 end
 
 
@@ -106,19 +130,22 @@ end
         @test all(serial.(pages) .== 1238561138)
     end
 
+    # check `streams` functionality
     OggDecoder(joinpath(@__DIR__, "zero.ogg")) do dec
         strs = streams(dec)
         @test length(strs) == 1
         @test eltype(strs) == Cint
         @test strs[1] == 1238561138
-    end
+        open(dec, streams(dec)[1]) do logstream
+            packets = collect(eachpacket(logstream))
+            # # There are four packets, the first starts with \x7fFLAC
+            @test length(packets) == 4
+            @test String(convert(Vector{UInt8}, packets[1])[2:5]) == "FLAC"
 
-    # # There are four packets, the first starts with \x7fFLAC
-    # @test length(ogg_packets[serial]) == 4
-    # @test String(copy(ogg_packets[serial][1][2:5])) == "FLAC"
-    #
-    # # The lengths of the packets are:
-    # @test [length(x) for x in ogg_packets[serial]] == [51, 55, 13, 0]
+            # The lengths of the packets are:
+            @test length.(packets) == [51, 55, 13, 0]
+        end
+    end
 end
 
 @testset "More complicated Ogg reading" begin
@@ -138,6 +165,7 @@ end
     local str1_pages2
     local str2_pages1
     local str2_pages2
+
     OggDecoder(fname) do dec
         strs = streams(dec)
         open(dec, strs[1]) do str1
@@ -168,38 +196,38 @@ end
     nocopypage = OggPage(rawpage; copy=false)
     @test nocopypage.headerbuf === nothing
     @test nocopypage.bodybuf === nothing
-    @test nocopypage.page == rawpage
+    @test nocopypage.rawpage == rawpage
 
     copypage = OggPage(rawpage)
-    @test copypage.page.header != pointer(rawheader)
-    @test copypage.page.body != pointer(rawbody)
-    @test copypage.page.header == pointer(copypage.headerbuf)
-    @test copypage.page.body == pointer(copypage.bodybuf)
-    @test unsafe_wrap(Array, copypage.page.header, 10) == rawheader
-    @test unsafe_wrap(Array, copypage.page.body, 20) == rawbody
-    @test copypage.page.header_len == 10
-    @test copypage.page.body_len == 20
+    @test copypage.rawpage.header != pointer(rawheader)
+    @test copypage.rawpage.body != pointer(rawbody)
+    @test copypage.rawpage.header == pointer(copypage.headerbuf)
+    @test copypage.rawpage.body == pointer(copypage.bodybuf)
+    @test unsafe_wrap(Array, copypage.rawpage.header, 10) == rawheader
+    @test unsafe_wrap(Array, copypage.rawpage.body, 20) == rawbody
+    @test copypage.rawpage.header_len == 10
+    @test copypage.rawpage.body_len == 20
 
     # make sure deepcopy works whether or not the source has its own data
     deepcopypage = deepcopy(nocopypage)
-    @test deepcopypage.page.header != pointer(rawheader)
-    @test deepcopypage.page.body != pointer(rawbody)
-    @test deepcopypage.page.header == pointer(deepcopypage.headerbuf)
-    @test deepcopypage.page.body == pointer(deepcopypage.bodybuf)
-    @test unsafe_wrap(Array, deepcopypage.page.header, 10) == rawheader
-    @test unsafe_wrap(Array, deepcopypage.page.body, 20) == rawbody
-    @test deepcopypage.page.header_len == 10
-    @test deepcopypage.page.body_len == 20
+    @test deepcopypage.rawpage.header != pointer(rawheader)
+    @test deepcopypage.rawpage.body != pointer(rawbody)
+    @test deepcopypage.rawpage.header == pointer(deepcopypage.headerbuf)
+    @test deepcopypage.rawpage.body == pointer(deepcopypage.bodybuf)
+    @test unsafe_wrap(Array, deepcopypage.rawpage.header, 10) == rawheader
+    @test unsafe_wrap(Array, deepcopypage.rawpage.body, 20) == rawbody
+    @test deepcopypage.rawpage.header_len == 10
+    @test deepcopypage.rawpage.body_len == 20
 
     deepcopypage = deepcopy(copypage)
-    @test deepcopypage.page.header != pointer(copypage.headerbuf)
-    @test deepcopypage.page.body != pointer(copypage.bodybuf)
-    @test deepcopypage.page.header == pointer(deepcopypage.headerbuf)
-    @test deepcopypage.page.body == pointer(deepcopypage.bodybuf)
-    @test unsafe_wrap(Array, deepcopypage.page.header, 10) == rawheader
-    @test unsafe_wrap(Array, deepcopypage.page.body, 20) == rawbody
-    @test deepcopypage.page.header_len == 10
-    @test deepcopypage.page.body_len == 20
+    @test deepcopypage.rawpage.header != pointer(copypage.headerbuf)
+    @test deepcopypage.rawpage.body != pointer(copypage.bodybuf)
+    @test deepcopypage.rawpage.header == pointer(deepcopypage.headerbuf)
+    @test deepcopypage.rawpage.body == pointer(deepcopypage.bodybuf)
+    @test unsafe_wrap(Array, deepcopypage.rawpage.header, 10) == rawheader
+    @test unsafe_wrap(Array, deepcopypage.rawpage.body, 20) == rawbody
+    @test deepcopypage.rawpage.header_len == 10
+    @test deepcopypage.rawpage.body_len == 20
 end
 
 end # @testset
