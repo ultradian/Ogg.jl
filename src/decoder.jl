@@ -273,6 +273,8 @@ end
 function Base.close(stream::OggLogicalStream)
     stream.container.logstreams[stream.serial] = nothing
     stream.streamstate = ogg_stream_clear(stream.streamstate)
+
+    nothing
 end
 
 function Base.show(io::IO, dec::OggDecoder)
@@ -281,7 +283,7 @@ function Base.show(io::IO, dec::OggDecoder)
     println(io, "OggDecoder($(dec.io)")
     print(io,   "  $(length(strs)) logical stream$plural with serial$plural:")
     for str in strs
-        print.("\n    $str")
+        print(io, "\n    $str")
     end
 end
 
