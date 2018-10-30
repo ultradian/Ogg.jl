@@ -100,7 +100,7 @@ function encode_all_packets(enc::OggEncoder, packets::Dict{Clong,Vector{Vector{U
             # fit within a single page too, so we don't bother with the typical
             # while loop that would dump out excess data into its own page.
             if granulepos[serial][packet_idx] == 0
-                push!(pages, convert(Vector{UInt8}, ogg_stream_flush(enc, serial)))
+                push!(pages, Vector(ogg_stream_flush(enc, serial)))
             end
         end
 
@@ -114,7 +114,7 @@ function encode_all_packets(enc::OggEncoder, packets::Dict{Clong,Vector{Vector{U
         # pages moving, and this is better for code coverage purposes.
         page = ogg_stream_flush(enc, serial)
         while page != nothing
-            push!(pages, convert(Vector{UInt8}, page))
+            push!(pages, Vector(page))
             page = ogg_stream_pageout(enc, serial)
         end
     end

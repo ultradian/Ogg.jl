@@ -97,7 +97,7 @@ using Test
             # TODO: for some reason bos and eos are always false here
             # @test bos(packet) == (packet_idx == 1)
             # @test eos(packet) == (packet_idx == length(readpackets[serialnum]))
-            @test convert(Vector{UInt8}, packet) == packets[serialnum][packet_idx]
+            @test Vector(packet) == packets[serialnum][packet_idx]
         end
     end
 end
@@ -140,7 +140,7 @@ end
             packets = collect(eachpacket(logstream))
             # # There are four packets, the first starts with \x7fFLAC
             @test length(packets) == 4
-            @test String(convert(Vector{UInt8}, packets[1])[2:5]) == "FLAC"
+            @test String(Vector(packets[1])[2:5]) == "FLAC"
 
             # The lengths of the packets are:
             @test length.(packets) == [51, 55, 13, 0]

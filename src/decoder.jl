@@ -48,7 +48,12 @@ function Base.deepcopy(page::OggPage)
     OggPage(rawpage, headerbuf, bodybuf)
 end
 
-function Base.convert(::Type{Vector{UInt8}}, page::OggPage)
+"""
+    Vector(page::OggPage)
+
+Returns the raw `OggPage` data as a `Vector{UInt8}`
+"""
+function Base.Vector(page::OggPage)
     GC.@preserve page begin
         header_arr = unsafe_wrap(Array, page.rawpage.header, page.rawpage.header_len)
         body_arr = unsafe_wrap(Array, page.rawpage.body, page.rawpage.body_len)
@@ -126,7 +131,12 @@ function Base.deepcopy(packet::OggPacket)
     OggPacket(rawpacket, buf)
 end
 
-function Base.convert(::Type{Vector{UInt8}}, packet::OggPacket)
+"""
+    Vector(packet::OggPacket)
+
+Returns the raw `OggPacket` data as a `Vector{UInt8}`
+"""
+function Base.Vector(packet::OggPacket)
     GC.@preserve packet begin
         unsafe_wrap(Array, packet.rawpacket.packet, length(packet))
     end
