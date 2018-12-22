@@ -155,6 +155,24 @@ function ogg_stream_clear(stream::OggStreamState)
     streamref[]
 end
 
+"""
+This function reinitializes the values in the ogg_stream_state, just like
+ogg_stream_reset(). Additionally, it sets the stream serial number to the given
+value.
+"""
+function ogg_stream_reset_serialno(stream::OggStreamState, serialno::Integer)
+    streamref = Ref(stream)
+    status = ccall((:ogg_stream_reset_serialno,libogg), Cint,
+                   (Ref{OggStreamState}, Cint), streamref, serialno)
+    if status != 0
+        error("ogg_stream_reset_serialno() failed with status $status")
+    end
+
+    streamref[]
+end
+
+
+
 struct RawOggPacket
     # Pointer to the packet's data. This is treated as an opaque type by the ogg layer
     packet::Ptr{UInt8}
@@ -272,8 +290,10 @@ function ogg_sync_pageout(syncstate::OggSyncState)
                    (Ref{OggSyncState}, Ref{RawOggPage}),
                    syncref, page)
     if status == 1
+        @debug "ogg_sync_pageout: $(page[])"
         return page[], syncref[]
     else
+        @debug "ogg_sync_pageout: nothing"
         return nothing, syncref[]
     end
 end
@@ -303,6 +323,19 @@ Indicates whether the given page is an end-of-stream
 """
 function ogg_page_bos(page::RawOggPage)
     return ccall((:ogg_page_bos,libogg), Cint, (Ref{RawOggPage},), page) != 0
+end
+
+"""
+    ogg_page_granulepos(page::RawOggPage)
+
+Returns the exact granular position of the packet data contained at the end of this page.
+
+This is useful for tracking location when seeking or decoding.
+
+For example, in audio codecs this position is the pcm sample number and in video this is the frame number.
+"""
+function ogg_page_granulepos(page::RawOggPage)
+    return ccall((:ogg_page_granulepos, libogg), Int64, (Ref{RawOggPage},), page)
 end
 
 """
@@ -350,10 +383,13 @@ function ogg_stream_packetout(streamstate::OggStreamState, isretry=false)
     status = ccall((:ogg_stream_packetout,libogg), Cint,
                    (Ref{OggStreamState}, Ref{RawOggPacket}), streamref, packetref)
     if status == 1
+        @debug "ogg_stream_packetout: status 1"
         packetref[], streamref[]
     elseif status == 0
+        @debug "ogg_stream_packetout: status 0"
         nothing, streamref[]
     elseif status == -1 && !isretry
+        @debug "ogg_stream_packetout: status -1, retrying..."
         # Is our status -1?  That means we're desynchronized and should try one
         # more time
         ogg_stream_packetout(streamref[], true)
