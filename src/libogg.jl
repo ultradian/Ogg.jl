@@ -63,6 +63,21 @@ function ogg_sync_clear(sync::OggSyncState)
     syncref[]
 end
 
+"""
+This function is used to reset the internal counters of the ogg_sync_state
+struct to initial values.
+
+It is a good idea to call this before seeking within a bitstream.
+
+Returns the reset OggSyncState object.
+"""
+function ogg_sync_reset(sync::OggSyncState)
+    syncref = Ref(sync)
+    ccall((:ogg_sync_reset, libogg), Cint, (Ref{OggSyncState},), syncref)
+
+    syncref[]
+end
+
 struct RawOggPage
     # Pointer to the page header for this page
     header::Ptr{UInt8}
@@ -320,7 +335,7 @@ needed). Also returns the updated `OggSyncState` value.
 
 (docs adapted from https://xiph.org/ogg/doc/libogg/ogg_sync_pageout.html)
 """
-function ogg_sync_pageout(syncstate::OggSyncState)
+function ogg_sync_pageout(syncstate::OggSyncState, isretry=false)
     syncref = Ref(syncstate)
     page = Ref(RawOggPage())
     status = ccall((:ogg_sync_pageout,libogg), Cint,
@@ -328,10 +343,16 @@ function ogg_sync_pageout(syncstate::OggSyncState)
                    syncref, page)
     if status == 1
         @debug "ogg_sync_pageout: $(page[])"
-        return page[], syncref[]
-    else
+        page[], syncref[]
+    elseif status == 0
         @debug "ogg_sync_pageout: nothing"
-        return nothing, syncref[]
+        nothing, syncref[]
+    elseif status == -1 && !isretry
+        @debug "ogg_sync_pageout unsynced, retrying..."
+        ogg_sync_pageout(syncref[], true)
+    else
+        @warn "Got unexpected return value from ogg_sync_pageout: $status"
+        nothing, syncref[]
     end
 end
 
@@ -435,9 +456,7 @@ function ogg_stream_packetout(streamstate::OggStreamState, isretry=false)
         @debug "ogg_stream_packetout: status 0"
         nothing, streamref[]
     elseif status == -1 && !isretry
-        @debug "ogg_stream_packetout: status -1, retrying..."
-        # Is our status -1?  That means we're desynchronized and should try one
-        # more time
+        @debug "ogg_stream_packetout unsynced, retrying..."
         ogg_stream_packetout(streamref[], true)
     else
         @warn "Got unexpected return value from ogg_stream_packetout: $status"

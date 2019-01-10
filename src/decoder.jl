@@ -312,6 +312,7 @@ function clearbuffers(dec::OggDecoder)
             dec.logstreams[serial] = (str, OggPage[])
         end
     end
+    dec.syncstate = ogg_sync_reset(dec.syncstate)
 
     nothing
 end
@@ -428,7 +429,7 @@ Internal page read function that ignores the julia-side BOS page queue. Returns
 function _readpage(dec::OggDecoder, copy::Bool=true)
     # first check to see if there's already a page ready
     page, dec.syncstate = ogg_sync_pageout(dec.syncstate)
-    page !== nothing && return OggPage(page; copy=copy)
+    page === nothing || return OggPage(page; copy=copy)
 
     # no pages ready, so read more data until we get one
     while !eof(dec.io)
