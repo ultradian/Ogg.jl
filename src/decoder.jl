@@ -36,6 +36,7 @@ end
 serial(page::OggPage) = ogg_page_serialno(page.rawpage)
 bos(page::OggPage) = ogg_page_bos(page.rawpage)
 eos(page::OggPage) = ogg_page_eos(page.rawpage)
+granulepos(page::OggPage) = ogg_page_granulepos(page.rawpage)
 
 function Base.deepcopy(page::OggPage)
     headerbuf = Vector{UInt8}(undef, page.rawpage.header_len)
@@ -156,29 +157,41 @@ Represents a logical bitstream within a physical bitstream.
 """
 # parametric to break circular type definition. T should be an OggDecoder
 mutable struct OggLogicalStream{T}
-    streamstate::OggStreamState
-    serial::SerialNum
     container::T
-    eos::Bool
+    serial::SerialNum
+    streamstate::OggStreamState
 
     OggLogicalStream{T}(container, serialnum) where T =
-        new(OggStreamState(serialnum), serialnum, container, false)
+        new(container, serialnum, OggStreamState(serialnum))
 end
 
-OggLogicalStream(container::T, serialnum) where T =
-    OggLogicalStream{T}(container, serialnum)
+OggLogicalStream(container, serialnum) =
+    OggLogicalStream{OggDecoder}(container, serialnum)
+
+"""
+    clearbuffers(str::OggLogicalStream)
+
+Reset the internal buffers of the logical stream. This is called internally
+whenever the stream is seeked, so that the next `readpacket` won't get stale
+data.
+"""
+function clearbuffers(str::OggLogicalStream)
+    str.streamstate = ogg_stream_reset_serialno(str.streamstate, str.serial)
+end
 
 function Base.show(io::IO, str::OggLogicalStream)
     print(io, "OggLogicalStream with serial $(str.serial)")
 end
 
 # the type parameter is not actually used parametrically, so don't display it
-function Base.show(io::IO, ::Type{OggLogicalStream{T}}) where T
+function Base.show(io::IO, ::Type{<:OggLogicalStream})
     print(io, "OggLogicalStream")
 end
 
-# aliased for convenience
-const LogStreamDict = Dict{SerialNum, Union{Vector{OggPage}, Nothing}}
+# aliased for convenience.
+const LogStreamDict = Dict{SerialNum,
+                           Union{Tuple{OggLogicalStream, Vector{OggPage}},
+                                 Nothing}}
 
 """
     OggDecoder(io::IO, own=false)
@@ -256,23 +269,78 @@ function Base.close(dec::OggDecoder)
     nothing
 end
 
+# TODO: add tests for seeking functions
+Base.position(dec::OggDecoder) = position(dec.io)
+function Base.seek(dec::OggDecoder, pos)
+    seek(dec.io, pos)
+    clearbuffers(dec)
+    dec
+end
+function Base.skip(dec::OggDecoder, delta)
+    skip(dec.io, delta)
+    clearbuffers(dec)
+    dec
+end
+function Base.seekstart(dec::OggDecoder)
+    seekstart(dec.io)
+    clearbuffers(dec)
+    dec
+end
+function Base.seekend(dec::OggDecoder)
+    seekend(dec.io)
+    clearbuffers(dec)
+    dec
+end
+
 """
-    open(dec::OggDecoder, ser::SerialNum)
-    open(f::Function, dec::OggDecoder, ser::SerialNum)
+    clearbuffers(dec::OggDecoder)
+
+Clear all the internal buffers of the decoder and any opened
+`OggLogicalStreams`. The `OggDecoder` type buffers pages internally, e.g. when a
+page for a specific logical stream is requested but other pages are found along
+the way. These pages are buffered so they can be provided later. When the stream
+is seeked to a different location we need to clear out these buffers.
+"""
+function clearbuffers(dec::OggDecoder)
+    dec.bospages = OggPage[]
+    for (serial, strdata) in dec.logstreams
+        if strdata !== nothing
+            (str, pagebuf) = strdata
+            clearbuffers(str)
+            dec.logstreams[serial] = (str, OggPage[])
+        end
+    end
+
+    nothing
+end
+
+"""
+    open(dec::OggDecoder, serialno::SerialNum)
+    open(f::Function, dec::OggDecoder, serialno::SerialNum)
 
 Open a logical stream identified with the given serial number. Returns an
 `OggLogicalStream` object that you can read pages and packets from. The logical
 stream should be closed with `close(stream)`, or you can use `do` syntax to
 ensure that it is closed automatically.
 """
-function Base.open(dec::OggDecoder, str::SerialNum)
-    dec.logstreams[str] = OggPage[]
+function Base.open(dec::OggDecoder, serialno::SerialNum)
+    if dec.logstreams[serialno] !== nothing
+        # this is probably over-cautious, but it's not clear what should happen
+        # if there are multiple handles to a given logical stream that are open
+        # simultaneously
+        throw(ErrorException("Opening a logical stream more than once is not supported"))
+    end
+    str = OggLogicalStream(dec, serialno)
 
-    OggLogicalStream(dec, str)
+    # register the stream with the container. This is mostly needed so that
+    # the container can handle resetting all the streams when it is seeked.
+    dec.logstreams[serialno] = (str, OggPage[])
+
+    str
 end
 
-function Base.open(fn::Function, dec::OggDecoder, str::SerialNum)
-    stream = open(dec, str)
+function Base.open(fn::Function, dec::OggDecoder, serialno::SerialNum)
+    stream = open(dec, serialno)
     try
         fn(stream)
     finally
@@ -348,7 +416,8 @@ function readpage(dec::OggDecoder; copy=true)
 end
 
 """
-Internal page read function that ignores the julia-side BOS page queue
+Internal page read function that ignores the julia-side BOS page queue. Returns
+`nothing` if we're at the end of the stream.
 """
 function _readpage(dec::OggDecoder, copy::Bool=true)
     # first check to see if there's already a page ready
@@ -377,10 +446,13 @@ encounters pages for other opened logical streams it will buffer them.
 """
 function readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
     if !(serialnum in keys(dec.logstreams))
+        throw(ErrorException("OggDecoder error - stream $serialnum not found"))
+    end
+    if dec.logstreams[serialnum] === nothing
         throw(ErrorException("OggDecoder error - stream must be opened before reading"))
     end
     # first see if we have any pages in the queue
-    pagebuf = dec.logstreams[serialnum]
+    _, pagebuf = dec.logstreams[serialnum]
     isempty(pagebuf) || return popfirst!(pagebuf)
     page = readpage(dec, copy=false)
     while page !== nothing && serial(page) != serialnum
@@ -388,9 +460,10 @@ function readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
         # logical stream for it
         pageserial = serial(page)
         if pageserial in keys(dec.logstreams) && dec.logstreams[pageserial] !== nothing
+            _, buf = dec.logstreams[pageserial]
             # we're storing the page in the queue, so we need to copy the data
             # even if the user didn't request their page to be copied
-            push!(dec.logstreams[pageserial], deepcopy(page))
+            push!(buf, deepcopy(page))
         end
         page = readpage(dec, copy=false)
     end
@@ -401,17 +474,11 @@ end
 """
     readpage(stream::OggLogicalStream; copy=true)
 
-Read a page from the given logical stream.
+Read a page from the given logical stream. Returns `nothing` if there are no
+more pages.
 """
-function readpage(stream::OggLogicalStream; copy=true)
-    # stream.eos && return nothing
-    page = readpage(stream.container, stream.serial; copy=copy)
-    # if the page is the last in the stream than mark it so we know to stop
-    # reading
-    # stream.eos = eos(page)
-
-    page
-end
+readpage(stream::OggLogicalStream; copy=true) =
+    readpage(stream.container, stream.serial; copy=copy)
 
 """
     readpacket(stream::OggLogicalStream; copy=true)

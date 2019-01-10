@@ -93,7 +93,7 @@ using Test
         # Are the contents of the packets the same?
         for packet_idx in 1:length(readpackets[serialnum])
             packet = readpackets[serialnum][packet_idx]
-            @test sequencenum(packet) == packet_idx - 1
+            @test packetno(packet) == packet_idx - 1
             # TODO: for some reason bos and eos are always false here
             # @test bos(packet) == (packet_idx == 1)
             # @test eos(packet) == (packet_idx == length(readpackets[serialnum]))
