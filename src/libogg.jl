@@ -152,6 +152,8 @@ function ogg_stream_clear(stream::OggStreamState)
     streamref = Ref(stream)
     ccall((:ogg_stream_clear,libogg), Cint, (Ref{OggStreamState},), streamref)
 
+    @debug "ogg_stream_clear() called"
+
     streamref[]
 end
 
@@ -167,6 +169,8 @@ function ogg_stream_reset_serialno(stream::OggStreamState, serialno::Integer)
     if status != 0
         error("ogg_stream_reset_serialno() failed with status $status")
     end
+
+    @debug "ogg_stream_reset_serialno called with serial $serialno"
 
     streamref[]
 end
@@ -233,6 +237,7 @@ function ogg_sync_buffer(syncstate::OggSyncState, size)
     if buffer == C_NULL
         error("ogg_sync_buffer() failed: returned buffer NULL")
     end
+    @debug "ogg_sync_buffer ready to receive $size bytes"
 
     # note that the Array doesn't own the data, it will not be freed by Julia
     # when the array goes out of scope (which is what we want, because libogg
@@ -264,6 +269,7 @@ function ogg_sync_wrote(syncstate::OggSyncState, size)
         error("ogg_sync_wrote() failed: error code $status")
     end
 
+    @debug "ogg_sync_wrote notified with $size bytes"
     syncref[]
 end
 

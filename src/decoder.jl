@@ -99,7 +99,7 @@ bos(pkt::OggPacket) = pkt.rawpacket.b_o_s == 1
 eos(pkt::OggPacket) = pkt.rawpacket.e_o_s == 1
 Base.length(pkt::OggPacket) = pkt.rawpacket.bytes
 granulepos(pkt::OggPacket) = pkt.rawpacket.granulepos
-sequencenum(pkt::OggPacket) = pkt.rawpacket.packetno
+packetno(pkt::OggPacket) = pkt.rawpacket.packetno
 
 function Base.show(io::IO, x::OggPacket)
     bosflag = bos(x) ? "BOS" : ""
@@ -384,7 +384,7 @@ function readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
     isempty(pagebuf) || return popfirst!(pagebuf)
     page = readpage(dec, copy=false)
     while page !== nothing && serial(page) != serialnum
-        # this is not the page we're looking for buffer it if we have an open
+        # this is not the page we're looking for. buffer it if we have an open
         # logical stream for it
         pageserial = serial(page)
         if pageserial in keys(dec.logstreams) && dec.logstreams[pageserial] !== nothing
@@ -404,11 +404,11 @@ end
 Read a page from the given logical stream.
 """
 function readpage(stream::OggLogicalStream; copy=true)
-    stream.eos && return nothing
+    # stream.eos && return nothing
     page = readpage(stream.container, stream.serial; copy=copy)
     # if the page is the last in the stream than mark it so we know to stop
     # reading
-    stream.eos = eos(page)
+    # stream.eos = eos(page)
 
     page
 end
@@ -432,7 +432,7 @@ function readpacket(stream::OggLogicalStream; copy=true)
     packet, stream.streamstate = ogg_stream_packetout(stream.streamstate)
     while packet === nothing
         # don't need to copy because we're immediately pushing into the
-        # streamstate
+        # streamstate, which copies into its own buffer
         page = readpage(stream, copy=false)
         # if the page is nothing than the logical stream is over
         page === nothing && return nothing
@@ -440,8 +440,7 @@ function readpacket(stream::OggLogicalStream; copy=true)
         packet, stream.streamstate = ogg_stream_packetout(stream.streamstate)
     end
 
-    packet = OggPacket(packet, copy=copy)
-    packet
+    OggPacket(packet, copy=copy)
 end
 
 """
