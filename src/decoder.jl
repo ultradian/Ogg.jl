@@ -233,12 +233,12 @@ function OggDecoder(io::IO; own=false)
     # scan through all the pages with the BOS flag (they should all be at the
     # beginning) so we know what serials we're dealing with. We add them to the
     # bospages `Vector` so they're still available to users
-    page = _readpage(dec)
-    page === nothing || push!(dec.bospages, page)
-    while page !== nothing && bos(page)
-        dec.logstreams[serial(page)] = nothing
+    while true
         page = _readpage(dec)
-        page !== nothing && push!(dec.bospages, page)
+        page === nothing && break
+        push!(dec.bospages, page)
+        bos(page) || break
+        dec.logstreams[serial(page)] = nothing
     end
 
     # we end up with one extra page (the first one after the BOS pages) in
