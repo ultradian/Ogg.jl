@@ -103,7 +103,7 @@ struct OggStreamState
     # Each value is a byte, indicating packet segment length
     lacing_vals::Ptr{Cint}
     # Pointer to the lacing values for the packet segments within the current page
-    granule_vals::Int64
+    granule_vals::Ptr{Int64}
     # Total amount of storage (in bytes) allocated for storing lacing values
     lacing_storage::Clong
     # Fill marker for the current vs. total allocated storage of lacing values for the page
@@ -125,7 +125,7 @@ struct OggStreamState
     # Serial number of this logical bitstream
     serialno::Clong
     # Number of the current page within the stream
-    pageno::Cint
+    pageno::Clong
     # Number of the current packet
     packetno::Int64
     # Exact position of decoding/encoding process
@@ -141,6 +141,23 @@ struct OggStreamState
 
         streamstate[]
     end
+end
+
+function Base.show(io::IO, streamstate::OggStreamState)
+    println(io, "OggStreamState(")
+    for field in [
+            :body_data, :body_storage, :body_fill, :body_returned, :lacing_vals,
+            :granule_vals, :lacing_storage, :lacing_fill, :lacing_packet,
+            :lacing_returned, :header, :header_fill, :e_o_s, :b_o_s, :serialno,
+            :pageno, :packetno, :granulepos]
+        if field == :header
+            print(io, "  header=$(typeof(streamstate.header))(...)")
+        else
+            print(io, "  $field=$(getfield(streamstate, field))")
+        end
+        field == :granulepos || println(io, ",")
+    end
+    println(io, ")")
 end
 
 """
@@ -175,7 +192,21 @@ function ogg_stream_reset_serialno(stream::OggStreamState, serialno::Integer)
     streamref[]
 end
 
+"""
+This function is used to check the error or readiness condition of an
+ogg_stream_state structure.
 
+It is safe practice to ignore unrecoverable errors (such as an internal error
+caused by a malloc() failure) returned by ogg stream synchronization calls.
+Should an internal error occur, the ogg_stream_state structure will be cleared
+(equivalent to a call to ogg_stream_clear) and subsequent calls using this
+ogg_stream_state will be noops. Error detection is then handled via a single
+call to ogg_stream_check at the end of the operational block.
+"""
+function ogg_stream_check(stream::OggStreamState)
+    streamref = Ref(stream)
+    ccall((:ogg_stream_check, libogg), Cint, (Ref{OggStreamState},), streamref)
+end
 
 struct RawOggPacket
     # Pointer to the packet's data. This is treated as an opaque type by the ogg layer
@@ -311,6 +342,15 @@ Returns the serial number of the given page
 """
 function ogg_page_serialno(page::RawOggPage)
     return ccall((:ogg_page_serialno,libogg), Cint, (Ref{RawOggPage},), page)
+end
+
+"""
+    ogg_page_pageno(page::RawOggPage)
+
+Returns the page number of the given page
+"""
+function ogg_page_pageno(page::RawOggPage)
+    return ccall((:ogg_page_pageno, libogg), Cint, (Ref{RawOggPage},), page)
 end
 
 """
