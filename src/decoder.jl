@@ -188,7 +188,9 @@ function Base.show(io::IO, ::Type{<:OggLogicalStream})
     print(io, "OggLogicalStream")
 end
 
-# aliased for convenience.
+# aliased for convenience. For each logical stream we need to keep track of
+# two things - the OggLogicalStream which handles the page->packet decoding, and
+# a buffer of any pages that are queued up for a read.
 const LogStreamDict = Dict{SerialNum,
                            Union{Tuple{OggLogicalStream, Vector{OggPage}},
                                  Nothing}}
@@ -332,8 +334,8 @@ function Base.open(dec::OggDecoder, serialno::SerialNum)
     end
     str = OggLogicalStream(dec, serialno)
 
-    # register the stream with the container. This is mostly needed so that
-    # the container can handle resetting all the streams when it is seeked.
+    # register the stream with the container. This is needed so that the
+    # container can handle resetting all the streams when it is seeked.
     dec.logstreams[serialno] = (str, OggPage[])
 
     str
@@ -407,6 +409,10 @@ If `copy` is `false` then the OggPage will contain a pointer to data within the
 `dec`. This avoids the need to copy the data but the data will be
 overwritten on the next `readpage` call. Also if the `dec` is garbage-collected
 then the data will be invalid. Use `copy=false` with caution.
+
+Note that if there are any `OggLogicalStream`s open, they may have consumed
+pages, so this method will provide the next page that hasn't been read by a
+logical stream.
 """
 function readpage(dec::OggDecoder; copy=true)
     # first see if we have any pages in the queue
@@ -442,7 +448,11 @@ end
     readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
 
 Reads a page from the given logical stream within the decoder. If the decoder
-encounters pages for other opened logical streams it will buffer them.
+encounters pages for other opened logical streams it will buffer them. This
+method will usually not be called from user code - use
+`readpage(::OggLogicalStream)` instead.
+
+Returns `nothing` if there are no more pages in the given logical stream.
 """
 function readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
     if !(serialnum in keys(dec.logstreams))
@@ -468,7 +478,11 @@ function readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
         page = readpage(dec, copy=false)
     end
 
-    copy ? deepcopy(page) : page
+    if page === nothing
+        nothing
+    else
+        copy ? deepcopy(page) : page
+    end
 end
 
 """
