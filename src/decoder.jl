@@ -223,7 +223,7 @@ mutable struct OggDecoder{T<:IO}
     # opened). a value of `nothing` means the logical stream exists but is not
     # opened
     logstreams::LogStreamDict
-    bospages::Vector{OggPage}
+    pagebuf::Vector{OggPage}
 end
 
 function OggDecoder(io::IO; own=false)
@@ -232,11 +232,11 @@ function OggDecoder(io::IO; own=false)
     dec = OggDecoder(io, own, sync, LogStreamDict(), OggPage[])
     # scan through all the pages with the BOS flag (they should all be at the
     # beginning) so we know what serials we're dealing with. We add them to the
-    # bospages `Vector` so they're still available to users
+    # pagebuf `Vector` so they're still available to users
     while true
         page = _readpage(dec)
         page === nothing && break
-        push!(dec.bospages, page)
+        push!(dec.pagebuf, page)
         bos(page) || break
         dec.logstreams[serial(page)] = nothing
     end
@@ -294,6 +294,97 @@ function Base.seekend(dec::OggDecoder)
     dec
 end
 
+# TODO: I wonder if this should just be what we export as `seek`, rather than
+# giving the (less useful) ability to seek to a given byte location.
+"""
+Seek the Ogg stream to the page that contains the given granulepos. More
+precisely: The next page read from `dec` will be the first page with a
+granulepos greater than or equal to the given value.
+"""
+function seekgranule(dec::OggDecoder, target)
+    # This search process is somewhat tricky. For a given position,
+    # `seek(dec, pos); readpage(dec)` will give us the first page that starts
+    # at or after the given position:
+    #
+    # -----+-----+-----+-----
+    #  ... | p1  | p2  | ...
+    # -----------------------
+    #     ^ ^ : returns p2
+    #     |   : returns p1
+    #
+    # We start our binary search with the seek endpoints at the beginning and
+    # end of the file, and we check the point betweeen them. We compare the
+    # granule position at our seek point to the one we're looking for, and
+    # update either our minimum or maximum endpoint to tighten our bound. So if
+    # we're searching for a granule position that's somewhere in `p2`, the seek
+    # point we'll converge to is the beginning of `p1` (because that's the point
+    # where `readpage(dec)` will return `p2`). given that each seek in the
+    # binary search will require scanning to find the next page boundary and
+    # parsing a page, we might as well just switch to linear search once we are
+    # likely to be within a page. 4K is a typical page size, and could otherwise
+    # take another 16 seeks to get to zero in.
+
+    # Some more info here:
+    # https://wiki.xiph.org/GranulePosAndSeeking
+
+    minpos = 0
+    seekend(dec)
+    maxpos = position(dec)
+
+    while maxpos - minpos > 4096
+        pos = minpos + (maxpos - minpos) ÷ 2
+        seek(dec, pos)
+        page = readpage(dec, copy=false)
+        if page === nothing
+            maxpos = pos
+            continue
+        end
+        if granulepos(page) >= target
+            maxpos = pos
+        else
+            minpos = pos
+        end
+    end
+
+    seek(dec, minpos)
+    # find the first page with a granulepos equal or greater than our target
+    # we shouldn't have to go farther than `maxpos`
+    page = readpage(dec, copy=false)
+    while page !== nothing && granulepos(page) < target
+        page = readpage(dec, copy=false)
+    end
+
+    # if we found a page, save it to the buffer so it'll be the next one read
+    if page !== nothing
+        push!(dec.pagebuf, deepcopy(page))
+    end
+
+    dec
+end
+
+"""
+Gets the last page of the given ogg stream, or `nothing` if there are no pages
+"""
+function lastpage(dec::OggDecoder, copy=true)
+    tailbytes = 65307 # max size of an ogg page
+    seekend(dec)
+    # seek back a bit, but not before the beginning of the file
+    seek(dec, max(position(dec)-tailbytes, 0))
+
+    page = nothing
+    next = readpage(dec, copy=false)
+    while next !== nothing
+        page = next
+        next = readpage(dec, copy=false)
+    end
+
+    if page === nothing
+        nothing
+    else
+        copy ? deepcopy(page) : page
+    end
+end
+
 """
     clearbuffers(dec::OggDecoder)
 
@@ -304,7 +395,7 @@ the way. These pages are buffered so they can be provided later. When the stream
 is seeked to a different location we need to clear out these buffers.
 """
 function clearbuffers(dec::OggDecoder)
-    dec.bospages = OggPage[]
+    dec.pagebuf = OggPage[]
     for (serial, strdata) in dec.logstreams
         if strdata !== nothing
             (str, pagebuf) = strdata
@@ -417,7 +508,7 @@ logical stream.
 """
 function readpage(dec::OggDecoder; copy=true)
     # first see if we have any pages in the queue
-    isempty(dec.bospages) || return popfirst!(dec.bospages)
+    isempty(dec.pagebuf) || return popfirst!(dec.pagebuf)
 
     _readpage(dec, copy)
 end
