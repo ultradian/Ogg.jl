@@ -339,6 +339,9 @@ function seekgranule(dec::OggDecoder, target)
             maxpos = pos
             continue
         end
+        # make sure we haven't jumped into a different chain
+        # TODO: handle chained files properly instead of just erroring
+        @assert serial(page) in streams(dec)
         if granulepos(page) >= target
             maxpos = pos
         else
