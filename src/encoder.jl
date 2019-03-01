@@ -30,7 +30,7 @@ function ogg_stream_packetin(enc::OggEncoder, serial::Clong, data::Vector{UInt8}
         enc.streams[serial] = OggStreamState(serial)
 
         # Also initialize enc.pages for this serial
-        enc.pages[serial] = Vector{Vector{UInt8}}()
+        enc.pages[serial] = Vector{UInt8}[]
     end
 
     # Build ogg_packet structure
@@ -39,7 +39,9 @@ function ogg_stream_packetin(enc::OggEncoder, serial::Clong, data::Vector{UInt8}
 
     streamref = Ref(enc.streams[serial])
     packetref = Ref(packet)
-    status = ccall((:ogg_stream_packetin,libogg), Cint, (Ref{OggStreamState}, Ref{RawOggPacket}), streamref, packetref)
+    GC.@preserve data begin
+        status = ccall((:ogg_stream_packetin,libogg), Cint, (Ref{OggStreamState}, Ref{RawOggPacket}), streamref, packetref)
+    end
     enc.streams[serial] = streamref[]
     if status == -1
         error("ogg_stream_packetin() failed: Unknown failure")
@@ -55,10 +57,16 @@ function ogg_stream_pageout(enc::OggEncoder, serial::Clong)
     pageref = Ref(RawOggPage())
     status = ccall((:ogg_stream_pageout,libogg), Cint, (Ref{OggStreamState}, Ref{RawOggPage}), streamref, pageref)
     enc.streams[serial] = streamref[]
+
     if status == 0
         return nothing
     else
-        return OggPage(pageref[], copy=false)
+        # pageref has pointers to data stored in streamref, so we need to make
+        # sure that the stream is preserved until the data can be copied to
+        # the OggPage
+        @GC.preserve streamref begin
+            return OggPage(pageref[])
+        end
     end
 end
 
@@ -73,10 +81,9 @@ function ogg_stream_flush(enc::OggEncoder, serial::Clong)
     if status == 0
         return nothing
     else
-        return OggPage(pageref[], copy=false)
+        return OggPage(pageref[])
     end
 end
-
 
 """
     encode_all_packets(enc, packets, granulepos)
@@ -100,22 +107,26 @@ function encode_all_packets(enc::OggEncoder, packets::Dict{Clong,Vector{Vector{U
             # fit within a single page too, so we don't bother with the typical
             # while loop that would dump out excess data into its own page.
             if granulepos[serial][packet_idx] == 0
-                push!(pages, Vector(ogg_stream_flush(enc, serial)))
+                page = ogg_stream_flush(enc, serial)
+                # validatepage(Vector(page))
+                push!(pages, Vector(page))
+            else
+                # generate a page if there's a "reasonable" amount of data in the buffer
+                page = ogg_stream_pageout(enc, serial)
+                while page !== nothing
+                    # validatepage(Vector(page))
+                    push!(pages, Vector(page))
+                    page = ogg_stream_pageout(enc, serial)
+                end
             end
         end
 
-        # Flush and then pull all pages out.  Note that in a streaming situation,
-        # normally you would call ogg_stream_pageout(enc, serial) periodically, as
-        # you feed data into the stream with ogg_stream_packetin(), however in this
-        # case all the data has already been written, so we can simply blithely call
-        # ogg_stream_flush() and then read pages out until we run out of pages.
-        # Note further that we could call ogg_stream_flush() from within the while
-        # loop, however it is unnecessary as a single flush is enough to get the
-        # pages moving, and this is better for code coverage purposes.
+        # flush remaining data
         page = ogg_stream_flush(enc, serial)
-        while page != nothing
+        while page !== nothing
+            # validatepage(Vector(page))
             push!(pages, Vector(page))
-            page = ogg_stream_pageout(enc, serial)
+            page = ogg_stream_flush(enc, serial)
         end
     end
 

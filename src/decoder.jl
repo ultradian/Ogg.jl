@@ -29,7 +29,14 @@ function OggPage(page::RawOggPage; copy=true)
     if !copy
         OggPage(page, nothing, nothing)
     else
-        deepcopy(OggPage(page, copy=false))
+        # create new buffers and copy the data
+        headerbuf = Vector{UInt8}(undef, page.header_len)
+        unsafe_copyto!(pointer(headerbuf), page.header, page.header_len)
+        bodybuf = Vector{UInt8}(undef, page.body_len)
+        unsafe_copyto!(pointer(bodybuf), page.body, page.body_len)
+        newpage = RawOggPage(pointer(headerbuf), page.header_len,
+                             pointer(bodybuf), page.body_len)
+        OggPage(newpage, headerbuf, bodybuf)
     end
 end
 
@@ -38,27 +45,26 @@ bos(page::OggPage) = ogg_page_bos(page.rawpage)
 eos(page::OggPage) = ogg_page_eos(page.rawpage)
 granulepos(page::OggPage) = ogg_page_granulepos(page.rawpage)
 
-function Base.deepcopy(page::OggPage)
-    headerbuf = Vector{UInt8}(undef, page.rawpage.header_len)
-    unsafe_copyto!(pointer(headerbuf), page.rawpage.header, page.rawpage.header_len)
-    bodybuf = Vector{UInt8}(undef, page.rawpage.body_len)
-    unsafe_copyto!(pointer(bodybuf), page.rawpage.body, page.rawpage.body_len)
+const MAX_PAGE_SIZE = 65307
 
-    rawpage = RawOggPage(pointer(headerbuf), page.rawpage.header_len,
-                         pointer(bodybuf), page.rawpage.body_len)
-    OggPage(rawpage, headerbuf, bodybuf)
+function Base.deepcopy(page::OggPage)
+    OggPage(page.rawpage, copy=true)
 end
 
 """
     Vector(page::OggPage)
 
-Returns the raw `OggPage` data as a `Vector{UInt8}`
+Returns a copy of the raw `OggPage` data as a `Vector{UInt8}`.
 """
 function Base.Vector(page::OggPage)
-    GC.@preserve page begin
+    if page.headerbuf !== nothing && page.bodybuf !== nothing
+        vcat(page.headerbuf, page.bodybuf)
+    else
+        # this assumes that the `ogg_sync_state` holding this data is still
+        # alive. Make sure it's `GC.@preserve`ed!
         header_arr = unsafe_wrap(Array, page.rawpage.header, page.rawpage.header_len)
         body_arr = unsafe_wrap(Array, page.rawpage.body, page.rawpage.body_len)
-        return vcat(header_arr, body_arr)
+        vcat(header_arr, body_arr)
     end
 end
 
@@ -89,11 +95,21 @@ struct OggPacket
 end
 
 function OggPacket(packet::RawOggPacket; copy=true)
-    if !copy
-        OggPacket(packet, nothing)
+    if copy
+        buf = Vector{UInt8}(undef, packet.bytes)
+        unsafe_copyto!(pointer(buf), packet.packet, packet.bytes)
+        newpacket = RawOggPacket(pointer(buf), packet.bytes,
+                                 packet.b_o_s, packet.e_o_s,
+                                 packet.granulepos, packet.packetno)
+        OggPacket(newpacket, buf)
     else
-        deepcopy(OggPacket(packet, copy=false))
+        OggPacket(packet, nothing)
     end
+end
+
+# give a new OggPacket that carries all its own memory
+function Base.deepcopy(packet::OggPacket)
+    OggPacket(packet.rawpacket; copy=true)
 end
 
 bos(pkt::OggPacket) = pkt.rawpacket.b_o_s == 1
@@ -121,24 +137,15 @@ function Base.show(io::IO, ::MIME"text/plain", x::OggPacket)
               """)
 end
 
-# give a new OggPacket that carries all its own memory
-function Base.deepcopy(packet::OggPacket)
-    buf = Vector{UInt8}(undef, length(packet))
-    unsafe_copyto!(pointer(buf), packet.rawpacket.packet, length(packet))
-
-    rawpacket = RawOggPacket(pointer(buf), packet.rawpacket.bytes,
-                             packet.rawpacket.b_o_s, packet.rawpacket.e_o_s,
-                             packet.rawpacket.granulepos, packet.rawpacket.packetno)
-    OggPacket(rawpacket, buf)
-end
-
 """
     Vector(packet::OggPacket)
 
-Returns the raw `OggPacket` data as a `Vector{UInt8}`
+Returns the raw `OggPacket` data as a `Vector{UInt8}`. Does not copy the data.
 """
 function Base.Vector(packet::OggPacket)
-    GC.@preserve packet begin
+    if packet.buf !== nothing
+        packet.buf
+    else
         unsafe_wrap(Array, packet.rawpacket.packet, length(packet))
     end
 end
@@ -186,6 +193,13 @@ end
 # the type parameter is not actually used parametrically, so don't display it
 function Base.show(io::IO, ::Type{<:OggLogicalStream})
     print(io, "OggLogicalStream")
+end
+
+function Base.close(stream::OggLogicalStream)
+    stream.container.logstreams[stream.serial] = nothing
+    stream.streamstate = ogg_stream_clear(stream.streamstate)
+
+    nothing
 end
 
 # aliased for convenience. For each logical stream we need to keep track of
@@ -297,70 +311,141 @@ end
 # TODO: I wonder if this should just be what we export as `seek`, rather than
 # giving the (less useful) ability to seek to a given byte location.
 """
-Seek the Ogg stream to the page that contains the given granulepos. More
-precisely: The next page read from `dec` will be the first page with a
-granulepos greater than or equal to the given value.
+    seekgranule(logstr::OggLogicalStream, target)
+
+Seek the Ogg stream to prepare to read data at the given granulepos. More
+precisely, after this call the stream will be near `target`, and guaranteed to
+be able to read the first packet in the stream containing the granulepos
+`target`. The stream will generally end up within a few pages or packets of the
+target, whichever is larger.
+
+For sample-accurate seeking call `sync` on the logical stream, which will return
+the granulepos of the last decoded data. The next packet read will generally
+start at the next granulepos. For example:
+
+```julia
+target = 382712
+len = 48000
+
+# open the ogg decoder
+OggDecoder(path) do dec
+    # open the logical stream to read packets from
+    open(dec, streams(dec)[1]) do logstr
+        seekgranule(logstr, target)
+        next_gp = sync(logstr) + 1
+        # create a `OpusDecoder` (from the Opus.jl package) to decode the
+        # packets into audio samples. It takes a packet iterator and reads from
+        # it as needed.
+        OpusDecoder(eachpacket(logstr)) do auddec
+            # read and discard as many samples as we need to get to our target
+            read(auddec, target - next_gp)
+
+            # now we can start reading the desired samples
+            read(auddec, len)
+        end
+    end
+end
+```
 """
-function seekgranule(dec::OggDecoder, target)
-    # This search process is somewhat tricky. For a given position,
-    # `seek(dec, pos); readpage(dec)` will give us the first page that starts
-    # at or after the given position:
+function seekgranule(logstr::OggLogicalStream, target)
+    # This search process is somewhat tricky. For a given position, seeking the
+    # underlying stream with `seek(dec, pos); readpage(dec)` will give us the
+    # first page that starts at or after the given position:
     #
     # -----+-----+-----+-----
     #  ... | p1  | p2  | ...
-    # -----------------------
-    #     ^ ^ : returns p2
-    #     |   : returns p1
+    # -----+-----+-----+-----
+    #     ^ ^
+    #     | `- : returns p2
+    #     `--- : returns p1
     #
+    # Pages get the granulepos of the last packet that ends on that page. If no
+    # packets end on that page, it gets a granulepos of -1. For our purposes we
+    # consider these to be continuations of the previous page, so we skip them.
+    #
+    #  page         +-----------+ +---------+ +---------+ +--------------+
+    #  granulepos----------> 10 | |      20 | |      -1 | |           40 |
+    #               |           | |         | |         | |              |
+    #  packet       | +-----+ +-----+ +-----------------------+ +------+ |
+    #  granulepos------> 10 | |  20 | |                    30 | |   40 | |
+    #               | +-----+ +-----+ +-----------------------+ +------+ |
+    #               |           | |         | |         | | ^            |
+    #               +-----------+ +---------+ +---------+ +-|------------+
+    #                       ^             ^                 |
+    #                minpos |             | maxpos          `-- seek target (29)
+    #                       `-----+-------'
+    #                             `-- binary search result
+
+
     # We start our binary search with the seek endpoints at the beginning and
-    # end of the file, and we check the point betweeen them. We compare the
-    # granule position at our seek point to the one we're looking for, and
+    # end of the file, and we check the point halfway between them. We compare
+    # the granule position at our seek point to the one we're looking for, and
     # update either our minimum or maximum endpoint to tighten our bound. So if
     # we're searching for a granule position that's somewhere in `p2`, the seek
     # point we'll converge to is the beginning of `p1` (because that's the point
-    # where `readpage(dec)` will return `p2`). given that each seek in the
-    # binary search will require scanning to find the next page boundary and
-    # parsing a page, we might as well just switch to linear search once we are
-    # likely to be within a page. 4K is a typical page size, and could otherwise
-    # take another 16 seeks to get to zero in.
+    # where `readpage(dec)` will return `p2`).
+
+    # given that each seek in the binary search will require scanning to find
+    # the next page boundary and parsing a page, we might as well just switch to
+    # linear search once we are likely to be within a page. 4K is a typical page
+    # size, and could otherwise take another 16 seeks to get to zero in.
 
     # Some more info here:
     # https://wiki.xiph.org/GranulePosAndSeeking
+    # though some of the complexities are left "as an exercise to the reader"
 
+    # also here:
+    # http://web.archive.org/web/20031201054855/http://www.xiph.org/archives/theora-dev/200209/0040.html
+
+    dec = logstr.container
+    serialnum = logstr.serial
+
+    # TODO: to properly handle chained files we'd want to initialize these to
+    # the chain boundaries
     minpos = 0
     seekend(dec)
     maxpos = position(dec)
 
-    while maxpos - minpos > 4096
+    # we do some copy-free page-reading in this loop, so we need to make sure
+    # that the stream object sticks around as long as we're accessing those
+    # pages.
+    GC.@preserve logstr while maxpos - minpos > 4096
+        # we could be more clever about picking a point to seek to and reduce
+        # the number of seeks necessary. Currently we always go halfway
         pos = minpos + (maxpos - minpos) ÷ 2
         seek(dec, pos)
         page = readpage(dec, copy=false)
-        if page === nothing
+        # when searching we want to skip any pages that don't end a packet. They
+        # don't have a valid granulepos. Also skip any pages from other logical
+        # streams
+        # TODO: if we end up in a different chain here then it could keep
+        # reading until it gets to the end of the file. Probably want to be
+        # smarter about that
+        while page !== nothing && position(dec) <= maxpos &&
+              (serial(page) != serialnum || granulepos(page) == -1)
+            page = readpage(dec, copy=false)
+        end
+        if page === nothing || position(dec) > maxpos
+            # no valid pages start after this seek point
             maxpos = pos
             continue
         end
-        # make sure we haven't jumped into a different chain
-        # TODO: handle chained files properly instead of just erroring
-        @assert serial(page) in streams(dec)
         if granulepos(page) >= target
-            maxpos = pos
+            maxpos = pos-1
         else
             minpos = pos
         end
     end
 
+    # At this point we know that if we start reading from `minpos` we will hit a
+    # page that finishes a packet that is earlier than the one we're looking
+    # for. Note that we might not have enough of this preceeding packet to
+    # decode it. This means two useful things:
+    #  1. we'll get a known granulepos that's before what we're looking for, so
+    #     we can synchronize for sample-accuracy
+    #  2. The packet we're looking for starts somewhere after this, so we
+    #     definitely have all the data we need to decode it.
     seek(dec, minpos)
-    # find the first page with a granulepos equal or greater than our target
-    # we shouldn't have to go farther than `maxpos`
-    page = readpage(dec, copy=false)
-    while page !== nothing && granulepos(page) < target
-        page = readpage(dec, copy=false)
-    end
-
-    # if we found a page, save it to the buffer so it'll be the next one read
-    if page !== nothing
-        push!(dec.pagebuf, deepcopy(page))
-    end
 
     dec
 end
@@ -369,10 +454,9 @@ end
 Gets the last page of the given ogg stream, or `nothing` if there are no pages
 """
 function lastpage(dec::OggDecoder, copy=true)
-    tailbytes = 65307 # max size of an ogg page
     seekend(dec)
     # seek back a bit, but not before the beginning of the file
-    seek(dec, max(position(dec)-tailbytes, 0))
+    seek(dec, max(position(dec)-MAX_PAGE_SIZE, 0))
 
     page = nothing
     next = readpage(dec, copy=false)
@@ -381,7 +465,7 @@ function lastpage(dec::OggDecoder, copy=true)
         next = readpage(dec, copy=false)
     end
 
-    if page === nothing
+    GC.@preserve dec if page === nothing
         nothing
     else
         copy ? deepcopy(page) : page
@@ -412,15 +496,18 @@ function clearbuffers(dec::OggDecoder)
 end
 
 """
-    open(dec::OggDecoder, serialno::SerialNum)
-    open(f::Function, dec::OggDecoder, serialno::SerialNum)
+    open(dec::OggDecoder, serialno::Integer)
+    open(f::Function, dec::OggDecoder, serialno::Integer)
 
 Open a logical stream identified with the given serial number. Returns an
 `OggLogicalStream` object that you can read pages and packets from. The logical
 stream should be closed with `close(stream)`, or you can use `do` syntax to
 ensure that it is closed automatically.
 """
-function Base.open(dec::OggDecoder, serialno::SerialNum)
+function Base.open(dec::OggDecoder, serialno::Integer)
+    if serialno ∉ keys(dec.logstreams)
+        throw(ArgumentError("Serial $serialno not found. Valid serials for this stream are $(keys(dec.logstreams))"))
+    end
     if dec.logstreams[serialno] !== nothing
         # this is probably over-cautious, but it's not clear what should happen
         # if there are multiple handles to a given logical stream that are open
@@ -436,20 +523,13 @@ function Base.open(dec::OggDecoder, serialno::SerialNum)
     str
 end
 
-function Base.open(fn::Function, dec::OggDecoder, serialno::SerialNum)
+function Base.open(fn::Function, dec::OggDecoder, serialno::Integer)
     stream = open(dec, serialno)
     try
         fn(stream)
     finally
         close(stream)
     end
-end
-
-function Base.close(stream::OggLogicalStream)
-    stream.container.logstreams[stream.serial] = nothing
-    stream.streamstate = ogg_stream_clear(stream.streamstate)
-
-    nothing
 end
 
 function Base.show(io::IO, dec::OggDecoder)
@@ -523,7 +603,9 @@ Internal page read function that ignores the julia-side BOS page queue. Returns
 function _readpage(dec::OggDecoder, copy::Bool=true)
     # first check to see if there's already a page ready
     page, dec.syncstate = ogg_sync_pageout(dec.syncstate)
-    page === nothing || return OggPage(page; copy=copy)
+    GC.@preserve dec begin
+        page === nothing || return OggPage(page; copy=copy)
+    end
 
     # no pages ready, so read more data until we get one
     while !eof(dec.io)
@@ -532,7 +614,9 @@ function _readpage(dec::OggDecoder, copy::Bool=true)
         dec.syncstate = ogg_sync_wrote(dec.syncstate, bytes_read)
         page, dec.syncstate = ogg_sync_pageout(dec.syncstate)
 
-        page !== nothing && return OggPage(page; copy=copy)
+        GC.@preserve dec begin
+            page === nothing || return OggPage(page; copy=copy)
+        end
     end
 
     # we hit EOF without reading a page
@@ -560,7 +644,7 @@ function readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
     _, pagebuf = dec.logstreams[serialnum]
     isempty(pagebuf) || return popfirst!(pagebuf)
     page = readpage(dec, copy=false)
-    while page !== nothing && serial(page) != serialnum
+    GC.@preserve dec while page !== nothing && serial(page) != serialnum
         # this is not the page we're looking for. buffer it if we have an open
         # logical stream for it
         pageserial = serial(page)
@@ -576,7 +660,9 @@ function readpage(dec::OggDecoder, serialnum::SerialNum; copy=true)
     if page === nothing
         nothing
     else
-        copy ? deepcopy(page) : page
+        GC.@preserve dec begin
+            copy ? deepcopy(page) : page
+        end
     end
 end
 
@@ -599,10 +685,15 @@ task.
 Returns the new packet (an `OggPacket`), or `nothing` if there are no more
 packets in the stream.
 
+CAUTION:
+
 If `copy` is `false` then the OggPage will contain a pointer to data within the
-`dec`. This avoids the need to copy the data but the data will be
-overwritten on the next `readpage` call. Also if the `dec` is garbage-collected
-then the data will be invalid. Use `copy=false` with caution.
+`stream`. This avoids the need to copy the data but the data will be overwritten
+on the next `readpage` call. Also if the `stream` is closed then the data will
+be invalid. Use `copy=false` with caution, and make sure to keep `stream` open
+until the packet data is copied. It is also recommended to use `GC.@preserve` to
+maintain an active reference to `stream` for as long as the packet data is
+needed.
 """
 function readpacket(stream::OggLogicalStream; copy=true)
     packet, stream.streamstate = ogg_stream_packetout(stream.streamstate)
@@ -612,11 +703,65 @@ function readpacket(stream::OggLogicalStream; copy=true)
         page = readpage(stream, copy=false)
         # if the page is nothing than the logical stream is over
         page === nothing && return nothing
-        stream.streamstate = ogg_stream_pagein(stream.streamstate, page.rawpage)
+        # we need to preserve `stream` here because it also references the
+        # ogg_sync_state struct that contains the page data
+        GC.@preserve stream begin
+            stream.streamstate = ogg_stream_pagein(stream.streamstate, page.rawpage)
+        end
         packet, stream.streamstate = ogg_stream_packetout(stream.streamstate)
     end
 
-    OggPacket(packet, copy=copy)
+    GC.@preserve stream begin
+        OggPacket(packet, copy=copy)
+    end
+end
+
+"""
+    sync(stream::OggLogicalStream)
+
+Synchronizes the stream to the next known granulepos and returns it. The
+returned value will be the granulepos of the end of the last decoded packet, so
+the next packet returned by `readpacket(stream)` will have data starting at the
+next one.
+
+Returns `nothing` if we're at the end of the stream.
+"""
+function sync(stream::OggLogicalStream)
+    while true
+        packet, stream.streamstate = ogg_stream_packetout(stream.streamstate)
+        # if there's already a packet ready and it has a granulepos, we're done
+        if packet !== nothing && granulepos(packet) != -1
+            return GC.@preserve stream granulepos(packet)
+        end
+        packet === nothing && break
+    end
+    # read pages until we get one with a granulepos, meaning that a packet ends
+    # on that page
+    local page
+    while true
+        page = readpage(stream, copy=false)
+        page === nothing && return nothing
+        GC.@preserve stream begin
+            stream.streamstate = ogg_stream_pagein(stream.streamstate, page.rawpage)
+            granulepos(page) != -1 && break
+        end
+    end
+
+    # now read all available packets given the pages we've read in. The last
+    # packet we read will have the granulepos of the last page we read in. It's
+    # also possible that we don't read in any packets because the packet that
+    # ends on this page started on some earlier page before we started reading.
+    # That's OK too, though, we still know that the data in the next readable
+    # packet will start right after the page granulepos.
+
+    while true
+        packet, stream.streamstate = ogg_stream_packetout(stream.streamstate)
+        packet === nothing && break
+    end
+
+    # any access to `page` needs to make sure that the stream data doesn't get
+    # pulled out from underneath us
+    GC.@preserve stream granulepos(page)
 end
 
 """
@@ -626,7 +771,7 @@ Returns an iterator you can use to get the packets from an ogg physical bitstrea
 If you pass the `copy=false` keyword argument then the packet will point to data
 within the decoder buffer, and is only valid until the next packet is provided.
 """
-eachpacket(dec; copy=true) = OggPacketIterator(dec, copy)
+eachpacket(dec::OggLogicalStream; copy=true) = OggPacketIterator(dec, copy)
 
 struct OggPacketIterator
     dec::OggLogicalStream

@@ -9,7 +9,7 @@ module Ogg
 export OggEncoder
 export save
 export OggDecoder, OggLogicalStream, OggPage
-export streams, eachpage, readpage, lastpage, seekgranule
+export streams, eachpage, readpage, lastpage, seekgranule, sync
 export serial, bos, eos
 export OggPacket
 export readpacket, eachpacket, packetno, granulepos

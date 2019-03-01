@@ -1,6 +1,38 @@
 using Ogg
 using Test
 
+function validatepage(vec::Vector{UInt8})
+    io = IOBuffer(vec)
+    validatepage(io)
+end
+
+function validatepage(stream::IO)
+    magic = read(stream, 4)
+    magic == b"OggS" || throw(ErrorException("got $magic for magic"))
+    version = read(stream, UInt8)
+    version == 0x00 || throw(ErrorException("got $version for version"))
+    flags = read(stream, UInt8)
+    flags & 0x01 == 0 || @info "continued"
+    flags & 0x02 == 0 || @info "BOS"
+    flags & 0x04 == 0 || @info "EOS"
+    granpos = ltoh(read(stream, Int64))
+    @info "granulepos: $granpos"
+    serial = ltoh(read(stream, UInt32))
+    @info "serial: $serial"
+    seqnum = ltoh(read(stream, UInt32))
+    @info "seqnum: $seqnum"
+    xsum = ltoh(read(stream, UInt32))
+    @info "xsum: $xsum"
+    nsegs = read(stream, UInt8)
+    @info "nsegs: $nsegs"
+    lacingvals = read(stream, nsegs)
+    @info "lacingvals: $(Int.(lacingvals))"
+    # read out the data so we're ready for the next page
+    read(stream, sum(lacingvals))
+
+    nothing
+end
+
 @testset "Ogg.jl Tests" begin
 
 @testset "Ogg synthesis/analysis" begin
@@ -11,7 +43,7 @@ using Test
     num_packets = 10
     stream_ids = Cint[1, 2, 3]
     packets = Dict{Clong,Vector{Vector{UInt8}}}()
-    granulepos = Dict{Int64,Vector{Int64}}()
+    granules = Dict{Int64,Vector{Int64}}()
     for serial in stream_ids
         # The packets are all of different size (100, 200, 300, ... 1000)
         # the content of each packet is just incrementing bytes
@@ -19,12 +51,12 @@ using Test
 
         # Each packet will have a monotonically increasing granulepos, except for
         # the first two packets which are our "header" packets with granulepos == 0
-        granulepos[serial] = Int64[0, 0, [20*x for x in 1:(num_packets - 2)]...]
+        granules[serial] = Int64[0, 0, [20*x for x in 1:(num_packets - 2)]...]
     end
 
     # Now we write these packets out to an IOBuffer
     ogg_file = IOBuffer()
-    save(ogg_file, packets, granulepos)
+    save(ogg_file, packets, granules)
 
     # Rewind to the beginning of this IOBuffer and load the packets back in
     seekstart(ogg_file)
@@ -32,12 +64,14 @@ using Test
 
     # the streams are chained together serially, so just decode the right number
     # of links
-    # TODO: currently we only go through the first link in the chain. There's
-    # a problem where the OggDecoder grabs too much data at the end of the link
+    # TODO: currently we only go through the first link in the chain. There's a
+    # problem where the OggDecoder grabs too much data at the end of the link
     # and so the next link doesn't start at the very beginning. Fixing this will
     # require some architecture and API changes - I think we'll want to have a
-    # single OggDecoder span all the links, so it can use the extra data it grabs
-    # after one link to start the next one.
+    # single OggDecoder span all the links, so it can use the extra data it
+    # grabs after one link to start the next one.
+    # Alternatively we could have an API to pull out the "leftover" data from
+    # one OggDecoder and hand it to the next one
     # for _ in stream_ids
         OggDecoder(ogg_file) do oggdec
             strs = streams(oggdec)
@@ -102,6 +136,58 @@ using Test
     end
 end
 
+@testset "Ogg Seeking" begin
+    function packetsplit(data, packetsize)
+        offsets = 0:packetsize:length(data)-packetsize
+        ([data[(1:packetsize).+offset] for offset in offsets],
+         [packetsize+offset for offset in offsets])
+    end
+    # data is incrementing Int64s, so we can uniquely identify locations in the
+    # stream
+    datamax = 1_000_000
+    rawdata = Int64.(1:datamax)
+    stream_id = 42
+    for packetsize in (100, 100000)
+        packets, granules = packetsplit(rawdata, packetsize)
+        packetdata = collect.(reinterpret.(UInt8, packets))
+
+        # Now we write these packets out to an IOBuffer
+        ogg_file = IOBuffer()
+        save(ogg_file, Dict(42 => [[UInt8.(1:100), UInt8.(1:100)]; packetdata]),
+                       Dict(42 => [[0, 0]; granules]))
+        seekstart(ogg_file)
+        OggDecoder(ogg_file) do oggdec
+            open(oggdec, stream_id) do logstr
+                # we'll check 50 random seek locations in the file
+                for _ in 1:50
+                    target = rand(1:datamax)
+                    seekgranule(logstr, target)
+                    current = sync(logstr)
+                    @test current < target
+                    packetsread = 0
+                    # if we happened to hit header packets, read past them
+                    local datapacket
+                    while true
+                        datapacket = readpacket(logstr)
+                        packetsread += 1
+                        granulepos(datapacket) != 0 && break
+                    end
+                    packet = reinterpret(Int64, Vector(datapacket))
+                    current += length(packet)
+                    packetsread += 1
+                    while current < target
+                        packet = reinterpret(Int64, Vector(readpacket(logstr)))
+                        current += length(packet)
+                        packetsread += 1
+                    end
+                    # @info "read $packetsread packets ($(packetsread*packetsize*8) bytes) to get to target"
+                    # check that we have exactly the sample that we wanted
+                    @test packet[end-(current-target)] == target
+                end
+            end
+        end
+    end
+end
 
 # Next, let's load a known ogg stream and ensure that it's exactly as we expect
 @testset "Known .ogg decoding" begin

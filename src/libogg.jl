@@ -115,9 +115,10 @@ struct OggStreamState
     body_returned::Clong
 
     # String of lacing values for the packet segments within the current page
-    # Each value is a byte, indicating packet segment length
+    # Each value is a byte, indicating packet segment length. also has some flags
+    # in the upper bytes
     lacing_vals::Ptr{Cint}
-    # Pointer to the lacing values for the packet segments within the current page
+    # Pointer to the granulepos values for the packet segments within the current page
     granule_vals::Ptr{Int64}
     # Total amount of storage (in bytes) allocated for storing lacing values
     lacing_storage::Clong
@@ -140,6 +141,8 @@ struct OggStreamState
     # Serial number of this logical bitstream
     serialno::Clong
     # Number of the current page within the stream
+    # note that as of 2019.02.28 the online docs have this field listed as an
+    # `int`, but in the header file it's a `long`
     pageno::Clong
     # Number of the current packet
     packetno::Int64
@@ -167,6 +170,9 @@ function Base.show(io::IO, streamstate::OggStreamState)
             :pageno, :packetno, :granulepos]
         if field == :header
             print(io, "  header=$(typeof(streamstate.header))(...)")
+        elseif field ∈ (:lacing_vals, :granule_vals)
+            arr = unsafe_wrap(Array, getfield(streamstate, field), streamstate.lacing_fill)
+            print(io, "  $field=$arr")
         else
             print(io, "  $field=$(getfield(streamstate, field))")
         end
@@ -325,6 +331,9 @@ end
 Takes the data stored in the buffer of the OggSyncState and inserts them into an
 ogg_page. Note that the payload data in the page is not copied, so the memory
 the RawOggPage points to is still contained within the OggSyncState struct.
+It is up to the caller to make sure that the `syncstate` does not get garbage-
+collected before the page data is used or copied. This often requires the use
+of `GC.@preserve`.
 
 Caution: This function should be called before reading into the buffer to ensure
 that data does not remain in the OggSyncState struct. Failing to do so may
@@ -426,6 +435,8 @@ function ogg_stream_pagein(streamstate::OggStreamState, page::RawOggPage)
 end
 
 """
+    ogg_stream_packetout(streamstate::OggStreamState)
+
 This function assembles a data packet for output to the codec decoding engine.
 The data has already been submitted to the OggStreamState and broken into
 segments. Each successive call returns the next complete packet built from those
@@ -440,6 +451,10 @@ submitted. A positive return value indicates successful return of a packet.
 The returned packet is filled in with pointers to memory managed by the stream
 state and is only valid until the next call. The client must copy the packet
 data if a longer lifetime is required.
+
+It is up to the caller to make sure that `streamstate` does not get garbage-
+collected before the page data is used or copied. This often requires the use
+of `GC.@preserve`.
 
 Returns a pair of the packet and the new `streamstate`. The packet is a
 `RawOggPacket` or `nothing` if the there isn't enough data buffered yet.
