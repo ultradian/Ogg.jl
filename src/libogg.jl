@@ -243,7 +243,9 @@ struct RawOggPacket
 
     # A number indicating the position of this packet in the decoded data
     # This is the last sample, frame or other unit of information ('granule')
-    # that can be completely decoded from this packet
+    # that can be completely decoded from this packet. When decoding this is
+    # deduced from the granulepos of the page, so it is only available if this
+    # was the last packet in the page. Otherwise it will be -1
     granulepos::Int64
     # Sequential number of this packet in the ogg bitstream
     packetno::Int64
